@@ -1,4 +1,4 @@
-// Imagio brand primitives: the logo mark (maroon tile in a coral frame), a
+// Imagio brand primitives: the logo mark (white "i" on a flat teal tile), a
 // decorative mosaic, and a 20-segment meter used for usage / progress displays.
 
 export function BrandMark() {

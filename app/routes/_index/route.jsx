@@ -22,7 +22,7 @@ export default function App() {
           Imagio
         </p>
         <h1 className={styles.heading}>
-          Every pixel, <em>perfectly tuned.</em>
+          Lighter photos. Faster store. <em>More sales.</em>
         </h1>
         <p className={styles.text}>
           Compression, AI alt text and speed testing for Shopify product photos — so your store looks

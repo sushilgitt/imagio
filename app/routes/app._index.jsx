@@ -103,6 +103,12 @@ export default function Index() {
     },
   ];
 
+  const steps = [
+    { title: "Pick your products", desc: "Open Compress and choose the products with the heaviest photos." },
+    { title: "Click Compress", desc: "Photos become lean WebP files, swapped in place on each product." },
+    { title: "Enjoy a faster store", desc: "Lighter pages load quicker — check the difference in Speed Lab." },
+  ];
+
   const stats = [
     { icon: PlanIcon, label: "Plan", value: plan.name },
     { icon: ImagesIcon, label: "Compressed this month", value: fmt(used) },
@@ -116,11 +122,11 @@ export default function Index() {
         <div className="pp-hero-main">
           <p className="pp-kicker"><BrandMark />IMAGIO</p>
           <h1>
-            Every pixel, <em>perfectly tuned.</em>
+            Lighter photos. Faster store. <em>More sales.</em>
           </h1>
           <p className="pp-hero-sub">
             Shrink product photos to WebP, give every image meaningful alt text, and watch your
-            storefront get quicker — all from one calm dashboard.
+            storefront get quicker — all from one simple dashboard.
           </p>
           <div className="pp-actions">
             <button type="button" className="pp-btn pp-btn-primary" onClick={() => navigate("/app/optimize")}>
@@ -159,7 +165,18 @@ export default function Index() {
         ))}
       </div>
 
-      <p className="pp-section-title"><BrandMark />Tools</p>
+      <p className="pp-section-title">How it works</p>
+      <div className="pp-steps">
+        {steps.map((s, i) => (
+          <div key={s.title} className="pp-step">
+            <span className="pp-step-num">{i + 1}</span>
+            <p className="pp-step-title">{s.title}</p>
+            <p className="pp-step-desc">{s.desc}</p>
+          </div>
+        ))}
+      </div>
+
+      <p className="pp-section-title">Your tools</p>
       <div className="pp-tools">
         {tools.map((t) => (
           <div key={t.title} className={`pp-tool${t.available ? "" : " pp-tool-locked"}`}>
