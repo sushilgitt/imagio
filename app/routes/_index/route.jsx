@@ -18,7 +18,7 @@ export default function App() {
     <div className={styles.index}>
       <div className={styles.content}>
         <p className={styles.eyebrow}>
-          <span className={styles.mark} aria-hidden="true"><i /><i /><i /></span>
+          <span className={styles.mark} aria-hidden="true"><span>i</span></span>
           Imagio
         </p>
         <h1 className={styles.heading}>

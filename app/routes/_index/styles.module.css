@@ -6,12 +6,9 @@
   justify-content: center;
   padding: 48px 20px;
   box-sizing: border-box;
-  color: #1C1530;
-  font-family: "DM Sans", system-ui, sans-serif;
-  background:
-    radial-gradient(680px 320px at 100% 0%, rgba(168, 85, 247, 0.16), transparent 65%),
-    radial-gradient(620px 300px at 0% 100%, rgba(255, 107, 87, 0.14), transparent 65%),
-    #FBF8F4;
+  color: #fff;
+  font-family: "Inter", system-ui, sans-serif;
+  background: linear-gradient(135deg, #A80F17 0%, #D81B27 32%, #F0404B 62%, #F7939C 100%);
 }
 
 .content {
@@ -27,38 +24,42 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
-  font: 600 13px/1 "Sora", sans-serif;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #7C3AED;
+  gap: 12px;
+  font: 800 22px/1 "Inter", sans-serif;
+  letter-spacing: -0.02em;
 }
 
 .mark {
   display: inline-grid;
-  grid-template-columns: repeat(2, 7px);
-  grid-template-rows: repeat(2, 7px);
-  gap: 2px;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  box-sizing: border-box;
+  padding: 5px;
+  border-radius: 12px;
+  background: #F86B6B;
 }
-.mark i { display: block; border-radius: 2px; }
-.mark i:nth-child(1) { background: #7C3AED; }
-.mark i:nth-child(2) { background: #FF6B57; }
-.mark i:nth-child(3) { background: #FFB547; grid-column: 2; }
+.mark > span {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 7px;
+  background: #8A2121;
+  color: #fff;
+  font: italic 800 19px/1 "Inter", sans-serif;
+}
 
 .heading {
   margin: 0;
-  font-family: "Sora", sans-serif;
   font-size: clamp(34px, 6vw, 56px);
-  font-weight: 700;
-  letter-spacing: -0.03em;
+  font-weight: 800;
+  letter-spacing: -0.035em;
   line-height: 1.05;
 }
 .heading em {
   font-style: normal;
-  background: linear-gradient(120deg, #7C3AED 0%, #A855F7 55%, #FF6B57 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: #FFE1E3;
 }
 
 .text {
@@ -66,7 +67,7 @@
   max-width: 560px;
   font-size: 16px;
   line-height: 1.6;
-  color: #6B6478;
+  color: rgba(255, 255, 255, 0.9);
 }
 
 .list {
@@ -80,21 +81,20 @@
 
 .list > li {
   text-align: left;
-  padding: 18px;
-  border-radius: 18px;
+  padding: 20px;
+  border-radius: 20px;
   background: #fff;
-  border: 1px solid #ECE6DD;
+  box-shadow: 0 2px 6px rgba(26, 26, 26, 0.06), 0 18px 44px rgba(80, 0, 6, 0.22);
   font-size: 14px;
   line-height: 1.55;
-  color: #6B6478;
+  color: #616161;
 }
 
 .list > li strong {
   display: block;
   margin-bottom: 4px;
-  font-family: "Sora", sans-serif;
   font-size: 16px;
-  color: #1C1530;
+  color: #1A1A1A;
 }
 
 @media only screen and (max-width: 50rem) {
@@ -105,10 +105,11 @@
 
 .note {
   margin: 0 auto;
-  padding: 12px 18px;
+  padding: 12px 20px;
   border-radius: 999px;
-  background: #F3EEFF;
-  color: #5B21B6;
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  color: #fff;
   font-size: 14px;
   font-weight: 500;
 }

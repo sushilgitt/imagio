@@ -1,10 +1,10 @@
-// Imagio brand primitives: the three-pixel logo mark, a decorative pixel
-// mosaic, and a 20-square "pixel meter" used for usage / progress displays.
+// Imagio brand primitives: the logo mark (maroon tile in a coral frame), a
+// decorative mosaic, and a 20-segment meter used for usage / progress displays.
 
 export function BrandMark() {
   return (
     <span className="pp-mark" aria-hidden="true">
-      <i /><i /><i />
+      <span>i</span>
     </span>
   );
 }
