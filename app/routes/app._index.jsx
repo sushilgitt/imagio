@@ -10,7 +10,6 @@ import {
   ImageMagicIcon,
   MagicIcon,
   AutomationIcon,
-  GaugeIcon,
   PlanIcon,
   ImagesIcon,
   CheckCircleIcon,
@@ -41,7 +40,6 @@ export const loader = async ({ request }) => {
       tier: plan?.tier || "free",
       monthlyImages: plan?.monthlyImages ?? 100,
       altText: entitled(plan, "altText"),
-      pageSpeed: entitled(plan, "pageSpeed"),
       autoOptimizeAllowed: entitled(plan, "autoOptimize"),
     },
     usage,
@@ -92,21 +90,12 @@ export default function Index() {
       available: plan.autoOptimizeAllowed,
       badge: autoStatus,
     },
-    {
-      icon: GaugeIcon,
-      title: "Speed Lab",
-      desc: "Run live Lighthouse tests on product pages and see exactly how much image weight you have shed.",
-      cta: plan.pageSpeed ? "Open Speed Lab" : "Unlock with Growth",
-      onClick: () => navigate(plan.pageSpeed ? "/app/speed" : "/app/plan"),
-      available: plan.pageSpeed,
-      badge: plan.pageSpeed ? undefined : { label: "Growth+", tone: "attention" },
-    },
   ];
 
   const steps = [
     { title: "Pick your products", desc: "Open Compress and choose the products with the heaviest photos." },
     { title: "Click Compress", desc: "Photos become lean WebP files, swapped in place on each product." },
-    { title: "Enjoy a faster store", desc: "Lighter pages load quicker — check the difference in Speed Lab." },
+    { title: "Enjoy a faster store", desc: "Lighter pages load quicker — and any product can be restored to its original photos." },
   ];
 
   const stats = [

@@ -467,7 +467,7 @@ body {
 .pp-row-saved { display: grid; gap: 2px; }
 .pp-row-saved strong { font-size: 13px; color: var(--pp-ink); }
 .pp-row-saved span { font-size: 11px; color: var(--pp-muted); }
-.pp-row-action { display: flex; justify-content: flex-end; }
+.pp-row-action { display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
 
 /* Score chip */
 .pp-score {

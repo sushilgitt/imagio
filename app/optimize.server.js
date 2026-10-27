@@ -108,13 +108,148 @@ export async function optimizeImage(imageUrl) {
   throw lastErr;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  SEO file names                                                            */
+/* -------------------------------------------------------------------------- */
+
+const MAX_NAME_LENGTH = 80; // before the extension
+
+function slugify(text) {
+  return String(text || "")
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/ß/g, "ss")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// Search-friendly base name for a product photo: product handle, then the
+// option values of the variant that shows it (e.g. "navy"), then its 1-based
+// position — "linen-shirt-navy-2". Position keeps names unique per product,
+// and handles are unique per shop, so names don't collide in Files.
+export function seoBaseName(handle, position, optionValues = []) {
+  const parts = [slugify(handle) || "product"];
+  for (const v of optionValues) {
+    const s = slugify(v);
+    if (s && s !== "default-title" && !parts.includes(s)) parts.push(s);
+  }
+  const suffix = `-${position}`;
+  const base = parts.join("-").slice(0, MAX_NAME_LENGTH - suffix.length).replace(/-+$/, "");
+  return `${base}${suffix}`;
+}
+
+// MediaImage id -> option values of the variants showing it. Budget:
+// 1 + variants(2 + 100 × (selectedOptions 1 + media 3)) ≈ 403.
+async function variantOptionsByMedia(admin, productId) {
+  const res = await admin.graphql(
+    `#graphql
+      query VariantOptions($id: ID!) {
+        product(id: $id) {
+          variants(first: 100) {
+            nodes { selectedOptions { value } media(first: 1) { nodes { id } } }
+          }
+        }
+      }`,
+    { variables: { id: productId } }
+  );
+  const json = await res.json();
+  const byMedia = new Map();
+  for (const v of json.data?.product?.variants?.nodes || []) {
+    const mediaId = v.media?.nodes?.[0]?.id;
+    if (!mediaId) continue;
+    const values = byMedia.get(mediaId) || [];
+    for (const o of v.selectedOptions || []) if (!values.includes(o.value)) values.push(o.value);
+    byMedia.set(mediaId, values);
+  }
+  // A photo shared by several variants only keeps the values they all have in
+  // common (e.g. "navy" across navy/S, navy/M) — a size would mislabel it.
+  for (const v of json.data?.product?.variants?.nodes || []) {
+    const mediaId = v.media?.nodes?.[0]?.id;
+    if (!mediaId) continue;
+    const mine = (v.selectedOptions || []).map((o) => o.value);
+    byMedia.set(mediaId, byMedia.get(mediaId).filter((x) => mine.includes(x)));
+  }
+  return byMedia;
+}
+
+// "https://cdn.shopify.com/s/files/…/Linen_Shirt.JPG?v=1" -> { name: "Linen_Shirt", ext: "jpg" }
+function fileNameFromUrl(url) {
+  const last = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+  const dot = last.lastIndexOf(".");
+  return dot > 0
+    ? { name: last.slice(0, dot), ext: last.slice(dot + 1).toLowerCase() }
+    : { name: last, ext: "" };
+}
+
+// Give every photo on a product its SEO name, in place — no re-encoding and no
+// credits. Keeps each file's extension; photos already named correctly are
+// left alone. Returns { success, productId, renamed, total, message }.
+export async function renameProductImages(admin, productId) {
+  const res = await admin.graphql(
+    `#graphql
+      query RenameProductMedia($id: ID!) {
+        product(id: $id) {
+          id
+          title
+          handle
+          media(first: 250) { nodes { id ... on MediaImage { image { url } } } }
+        }
+      }`,
+    { variables: { id: productId } }
+  );
+  const json = await res.json();
+  const product = json.data?.product;
+  if (!product) return { success: false, error: "Product not found", productId };
+
+  const images = product.media.nodes.filter((n) => n?.image?.url);
+  const options = await variantOptionsByMedia(admin, productId);
+  const current = images.map((img) => fileNameFromUrl(img.image.url));
+  const files = [];
+  images.forEach((img, i) => {
+    const { name, ext } = current[i];
+    const target = seoBaseName(product.handle, i + 1, options.get(img.id));
+    if (name !== target) files.push({ id: img.id, filename: ext ? `${target}.${ext}` : target });
+  });
+
+  // After the merchant reorders photos, two of them can want each other's
+  // names. Move those through a temporary name first so neither collides.
+  const taken = new Set(current.map((c) => (c.ext ? `${c.name}.${c.ext}` : c.name)));
+  const swaps = files.filter((f) => taken.has(f.filename));
+  const passes = [
+    swaps.map((f) => ({ id: f.id, filename: f.filename.replace(/(\.[^.]+)?$/, `-${Date.now()}$1`) })),
+    files,
+  ];
+
+  for (const pass of passes) {
+    for (let i = 0; i < pass.length; i += 25) {
+      const err = await updateFiles(admin, pass.slice(i, i + 25));
+      if (err) {
+        return { success: false, productId, error: `Could not rename photos on "${product.title}": ${err}` };
+      }
+    }
+  }
+
+  return {
+    success: true,
+    productId,
+    title: product.title,
+    renamed: files.length,
+    total: images.length,
+    message: files.length > 0
+      ? `Renamed ${files.length} photo(s) on "${product.title}"`
+      : `Photos on "${product.title}" already have SEO names`,
+  };
+}
+
 // Upload the optimized buffer via a Shopify staged upload and register it as a
 // new file (MediaImage). Returns the new MediaImage gid. The file is NOT yet on
 // the product — finalizeReplacements attaches it once Shopify has processed it.
-export async function uploadOptimizedImage(admin, optimizedBuffer, altText) {
+// `baseName` is the file name without extension (see seoBaseName).
+export async function uploadOptimizedImage(admin, optimizedBuffer, altText, baseName = `imagio-${Date.now()}`) {
   const isWebP = optimizedBuffer[8] === 0x57 && optimizedBuffer[9] === 0x45;
   const mimeType = isWebP ? "image/webp" : "image/jpeg";
-  const filename = `imagio-${Date.now()}.${isWebP ? "webp" : "jpg"}`;
+  const filename = `${baseName}.${isWebP ? "webp" : "jpg"}`;
 
   const stagedRes = await admin.graphql(
     `#graphql
@@ -327,6 +462,178 @@ async function finalizeReplacements(admin, productId, replacements, mediaOrder) 
   return abandoned;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Restore — undo optimization, putting the original photos back             */
+/* -------------------------------------------------------------------------- */
+
+// Reverse of finalizeReplacements for one product. Every "optimized" record
+// remembers { originalImageId, newImageId }; the original file was only
+// detached, so it is re-attached, variants are pointed back at it, it takes the
+// copy's position, and the copy is deleted. Records are then removed so the
+// product reads as never optimized. Usage is not refunded.
+// Originals the merchant has since deleted from Files can't come back — those
+// copies stay on the product and their records are kept.
+// Returns { success, productId, restored, unavailable, message }.
+export async function restoreProduct(admin, productId) {
+  const response = await admin.graphql(
+    `#graphql
+      query RestoreProductMedia($id: ID!) {
+        product(id: $id) {
+          id
+          title
+          media(first: 250) { nodes { id } }
+          metafields(first: 250, namespace: "image_optimization") {
+            nodes { key value }
+          }
+        }
+      }`,
+    { variables: { id: productId } }
+  );
+  const data = await response.json();
+  const product = data.data?.product;
+  if (!product) return { success: false, error: "Product not found", productId };
+
+  const mediaOrder = product.media.nodes.map((n) => n.id);
+  const onProduct = new Set(mediaOrder);
+  const records = [];
+  for (const node of product.metafields.nodes) {
+    if (!node.key.startsWith("image_")) continue;
+    try { records.push({ key: node.key, rec: JSON.parse(node.value) }); }
+    catch { records.push({ key: node.key, rec: null }); }
+  }
+
+  // Swaps still in place on the product: the copy is here, the original isn't.
+  const swaps = records
+    .filter(({ rec }) => rec?.status === "optimized" && rec.newImageId && rec.originalImageId)
+    .filter(({ rec }) => onProduct.has(rec.newImageId) && !onProduct.has(rec.originalImageId))
+    .map(({ key, rec }) => ({ key, oldId: rec.originalImageId, newId: rec.newImageId }));
+
+  // Only originals that still exist in Files (and are usable) can come back.
+  let restorable = [];
+  if (swaps.length > 0) {
+    const res = await admin.graphql(
+      `#graphql
+        query OriginalFiles($ids: [ID!]!) {
+          nodes(ids: $ids) { ... on MediaImage { id status } }
+        }`,
+      { variables: { ids: swaps.map((s) => s.oldId) } }
+    );
+    const json = await res.json();
+    const ready = new Set((json.data?.nodes || []).filter((n) => n?.status === "READY").map((n) => n.id));
+    restorable = swaps.filter((s) => ready.has(s.oldId));
+  }
+  const unavailable = new Set(swaps.filter((s) => !restorable.includes(s)).map((s) => s.key));
+
+  if (restorable.length > 0) {
+    const attachErr = await updateFiles(admin, restorable.map((s) => ({ id: s.oldId, referencesToAdd: [productId] })));
+    if (attachErr) {
+      // Nothing has changed on the product yet — stop and leave it as it is.
+      console.error(`[RESTORE] attach originals to ${productId}:`, attachErr);
+      return { success: false, productId, error: `Could not restore "${product.title}": ${attachErr}` };
+    }
+
+    // Variants showing a copy — read before the copies are detached.
+    const oldIdFor = new Map(restorable.map((s) => [s.newId, s.oldId]));
+    const varRes = await admin.graphql(
+      `#graphql
+        query RestoreVariantMedia($id: ID!) {
+          product(id: $id) {
+            variants(first: 100) { nodes { id media(first: 1) { nodes { id } } } }
+          }
+        }`,
+      { variables: { id: productId } }
+    );
+    const varJson = await varRes.json();
+    const variantMedia = (varJson.data?.product?.variants?.nodes || [])
+      .map((v) => ({ variantId: v.id, newId: v.media?.nodes?.[0]?.id }))
+      .filter((v) => v.newId && oldIdFor.has(v.newId))
+      .map((v) => ({ variantId: v.variantId, mediaIds: [oldIdFor.get(v.newId)] }));
+
+    // Detaching the copies also clears them from their variants.
+    const detachErr = await updateFiles(admin, restorable.map((s) => ({ id: s.newId, referencesToRemove: [productId] })));
+    if (detachErr) console.error(`[RESTORE] detach copies from ${productId}:`, detachErr);
+
+    if (variantMedia.length > 0) {
+      const res = await admin.graphql(
+        `#graphql
+          mutation RestoreVariantImages($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+            productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+              userErrors { field message }
+            }
+          }`,
+        { variables: { productId, variantMedia } }
+      );
+      const json = await res.json();
+      const err = json.errors?.[0]?.message || json.data?.productVariantAppendMedia?.userErrors?.[0]?.message;
+      if (err) console.error(`[RESTORE] variant media for ${productId}:`, err);
+    }
+
+    // Originals were appended at the end; move each into its copy's slot.
+    const moves = restorable
+      .map((s) => ({ id: s.oldId, newPosition: mediaOrder.indexOf(s.newId) }))
+      .filter((m) => m.newPosition >= 0)
+      .sort((a, b) => a.newPosition - b.newPosition)
+      .map((m) => ({ id: m.id, newPosition: String(m.newPosition) }));
+    if (moves.length > 0) {
+      const res = await admin.graphql(
+        `#graphql
+          mutation RestoreOriginalOrder($id: ID!, $moves: [MoveInput!]!) {
+            productReorderMedia(id: $id, moves: $moves) {
+              mediaUserErrors { field message }
+            }
+          }`,
+        { variables: { id: productId, moves } }
+      );
+      const json = await res.json();
+      const err = json.errors?.[0]?.message || json.data?.productReorderMedia?.mediaUserErrors?.[0]?.message;
+      if (err) console.error(`[RESTORE] reorder media for ${productId}:`, err);
+    }
+
+    // The copies are Imagio's own files; once detached, nothing needs them.
+    if (!detachErr) await deleteFiles(admin, restorable.map((s) => s.newId));
+  }
+
+  // Drop every record except swaps that couldn't be undone, so the product
+  // shows as unoptimized (and can be compressed again later).
+  const kept = records.filter(({ key }) => unavailable.has(key));
+  const dropKeys = records.filter(({ key }) => !unavailable.has(key)).map(({ key }) => key);
+  if (kept.length === 0) dropKeys.push("optimization_summary");
+  for (let i = 0; i < dropKeys.length; i += 25) {
+    const res = await admin.graphql(
+      `#graphql
+        mutation DropOptimizationRecords($metafields: [MetafieldIdentifierInput!]!) {
+          metafieldsDelete(metafields: $metafields) {
+            userErrors { field message }
+          }
+        }`,
+      {
+        variables: {
+          metafields: dropKeys.slice(i, i + 25).map((key) => ({
+            ownerId: productId, namespace: "image_optimization", key,
+          })),
+        },
+      }
+    );
+    const json = await res.json();
+    const err = json.errors?.[0]?.message || json.data?.metafieldsDelete?.userErrors?.[0]?.message;
+    if (err) console.error(`[RESTORE] drop records for ${productId}:`, err);
+  }
+  if (kept.length > 0) {
+    await writeSummary(admin, productId, mediaOrder.length, kept.map(({ rec }) => rec).filter(Boolean));
+  }
+
+  return {
+    success: true,
+    productId,
+    title: product.title,
+    restored: restorable.length,
+    unavailable: unavailable.size,
+    message: unavailable.size > 0
+      ? `Restored ${restorable.length} photo(s) on "${product.title}" — ${unavailable.size} original(s) were deleted from Files and can't come back`
+      : `Restored "${product.title}" to its original photos`,
+  };
+}
+
 export async function generateAIAltText(imageUrl, productTitle) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return `${productTitle} - product image`;
@@ -423,6 +730,7 @@ export async function optimizeBatch(admin, productId, opts = {}) {
         product(id: $id) {
           id
           title
+          handle
           media(first: 250) {
             edges { node { id ... on MediaImage { image { url altText } } } }
           }
@@ -481,6 +789,7 @@ export async function optimizeBatch(admin, productId, opts = {}) {
   // Cap the batch to both the per-call batch size and the remaining quota.
   const cap = Math.max(0, Math.min(BATCH_SIZE, remainingQuota));
   const batch = pending.slice(0, cap);
+  const options = batch.length > 0 ? await variantOptionsByMedia(admin, productId) : new Map();
 
   // Process this batch in parallel. Each result is a per-image metafield record.
   const batchResults = (await mapLimit(batch, BATCH_CONCURRENCY, async (image) => {
@@ -504,7 +813,9 @@ export async function optimizeBatch(admin, productId, opts = {}) {
         altText = await generateAIAltText(image.url, product.title);
       }
 
-      const newId = await uploadOptimizedImage(admin, opt.optimizedBuffer, altText);
+      const position = images.findIndex(i => i.id === image.id) + 1;
+      const baseName = seoBaseName(product.handle, position, options.get(image.id));
+      const newId = await uploadOptimizedImage(admin, opt.optimizedBuffer, altText, baseName);
       const key = `image_${newId.split("/").pop()}`;
       return {
         key,

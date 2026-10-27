@@ -7,7 +7,7 @@ import { getBillingStateCached } from '../billing.server';
 import { getUsage, getRemaining } from '../usage.server';
 import { entitled } from '../plans.server';
 import db from '../db.server';
-import { mapLimit, headSizeMB, optimizeBatch } from '../optimize.server';
+import { mapLimit, headSizeMB, optimizeBatch, restoreProduct, renameProductImages } from '../optimize.server';
 import { PixelMeter } from '../components/Pixels';
 import { fetchAllProducts, imageNodes, parseSummary, MAX_MEDIA_PER_PRODUCT } from '../catalog.server';
 import {
@@ -21,7 +21,8 @@ import {
   Thumbnail,
   Banner,
   Select,
-  EmptyState
+  EmptyState,
+  Modal
 } from '@shopify/polaris';
 
 /* -------------------------------------------------------------------------- */
@@ -225,12 +226,59 @@ export async function action({ request }) {
     }
   }
 
+  // SEO rename touches only file names — every plan, no credits.
+  if (actionType === 'renameProduct') {
+    const productId = formData.get('productId');
+    try {
+      return await renameProductImages(admin, productId);
+    } catch (error) {
+      const msg = error?.graphQLErrors?.[0]?.message || error?.message || 'unknown error';
+      console.error('[RENAME] product failed:', msg);
+      return { success: false, productId, error: 'Failed to rename photos: ' + msg };
+    }
+  }
+
+  // Restore is a safety net, so it's available on every plan and uses no credits.
+  if (actionType === 'restoreProduct') {
+    const productId = formData.get('productId');
+    try {
+      return await restoreProduct(admin, productId);
+    } catch (error) {
+      const msg = error?.graphQLErrors?.[0]?.message || error?.message || 'unknown error';
+      console.error('[RESTORE] product failed:', msg);
+      return { success: false, productId, error: 'Failed to restore product: ' + msg };
+    }
+  }
+
   return { success: false, error: 'Invalid action' };
 }
 
 /* -------------------------------------------------------------------------- */
 /*  UI                                                                        */
 /* -------------------------------------------------------------------------- */
+
+// Per-product tools that run outside the compression loop (no credits used).
+const TOOLS = {
+  restore: {
+    actionType: 'restoreProduct',
+    label: 'Restore',
+    busy: 'Restoring',
+    title: (n) => (n > 1 ? `Restore ${n} products?` : 'Restore original photos?'),
+    body: 'The original photos go back on the product in the same order, including variant images and '
+      + 'their original alt text. The compressed copies are deleted. Credits already used this month '
+      + 'are not refunded.',
+  },
+  rename: {
+    actionType: 'renameProduct',
+    label: 'Rename',
+    busy: 'Renaming',
+    title: (n) => (n > 1 ? `Give ${n} products SEO file names?` : 'Give this product SEO file names?'),
+    body: 'Each photo is renamed from the product and its variant, e.g. linen-shirt-navy-2.jpg, so search '
+      + 'engines can read what it shows. Photos stay on the product in the same order and nothing is '
+      + 're-encoded. Uses no credits. Links to the old file URL outside your product pages (for example '
+      + 'in a blog post or email) will stop working.',
+  },
+};
 
 export default function ProductOptimization() {
   const {
@@ -239,6 +287,7 @@ export default function ProductOptimization() {
   } = useLoaderData();
   const fetcher = useFetcher();
   const settingsFetcher = useFetcher();
+  const toolFetcher = useFetcher();
   const revalidator = useRevalidator();
 
   const [filter, setFilter] = useState(initialFilter);
@@ -257,6 +306,11 @@ export default function ProductOptimization() {
   // Track images optimized this session so the usage meter moves without a reload.
   const [sessionImages, setSessionImages] = useState(0);
   const lastOptimizedRef = useRef({}); // productId -> optimized count last seen
+
+  // Restore and SEO rename run one product per request through their own queue.
+  const [toolTask, setToolTask] = useState(null);       // { kind, id } in flight
+  const [confirmTool, setConfirmTool] = useState(null); // { kind, ids } awaiting confirmation
+  const toolQueueRef = useRef([]);
 
   const startNext = useCallback(() => {
     const next = queueRef.current.shift();
@@ -334,12 +388,56 @@ export default function ProductOptimization() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settingsFetcher.state, settingsFetcher.data]);
 
+  const toolNext = useCallback((kind) => {
+    const next = toolQueueRef.current.shift();
+    if (!next) {
+      setToolTask(null);
+      revalidator.revalidate();
+      return;
+    }
+    setToolTask({ kind, id: next });
+    toolFetcher.submit({ actionType: TOOLS[kind].actionType, productId: next }, { method: 'post' });
+  }, [toolFetcher, revalidator]);
+
+  useEffect(() => {
+    if (toolFetcher.state !== 'idle' || !toolFetcher.data || !toolTask) return;
+    const data = toolFetcher.data;
+    if (!data.productId || data.productId !== toolTask.id) return;
+    if (data.success === false) {
+      setError(data.error || `${TOOLS[toolTask.kind].label} failed`);
+    } else {
+      if (toolTask.kind === 'restore') {
+        // Show the product as untouched straight away; the revalidate at the
+        // end of the queue brings the real numbers back from the loader.
+        setLiveProgress(prev => ({
+          ...prev,
+          [data.productId]: { score: 0, optimized: 0, sizeSavedMB: 0, compressionRate: 0 },
+        }));
+        lastOptimizedRef.current[data.productId] = 0;
+      }
+      setSuccessMessage(data.message);
+      setTimeout(() => setSuccessMessage(null), 4000);
+    }
+    toolNext(toolTask.kind);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolFetcher.state, toolFetcher.data]);
+
+  const handleConfirmTool = useCallback(() => {
+    const { kind, ids } = confirmTool || {};
+    setConfirmTool(null);
+    if (!ids?.length || activeRef.current || toolTask) return;
+    setError(null);
+    setSelectedProducts([]);
+    toolQueueRef.current = [...ids];
+    toolNext(kind);
+  }, [confirmTool, toolTask, toolNext]);
+
   const beginQueue = useCallback((ids) => {
-    if (!ids.length || activeRef.current) return;
+    if (!ids.length || activeRef.current || toolTask) return;
     setError(null);
     queueRef.current = [...ids];
     startNext();
-  }, [startNext]);
+  }, [startNext, toolTask]);
 
   // Filter/sort are pure client-side transforms of the already-loaded product
   // list — no server roundtrip, so the list updates instantly.
@@ -385,7 +483,7 @@ export default function ProductOptimization() {
     setSelectedProducts([]);
   }, [beginQueue, selectedProducts]);
 
-  const isBusy = activeId !== null;
+  const isBusy = activeId !== null || toolTask !== null;
 
   // Usage meter: loader baseline + images optimized live this session.
   const quota = plan?.monthlyImages ?? 100;
@@ -431,8 +529,9 @@ export default function ProductOptimization() {
 
   const liveSavings = stats.potentialSavingsMB
     + Object.entries(liveProgress).reduce((sum, [id, lp]) => {
+        // Negative after a restore, which hands the savings back.
         const base = products.find(p => p.id === id)?.sizeSavedMB || 0;
-        return sum + Math.max(0, (lp.sizeSavedMB || 0) - base);
+        return sum + ((lp.sizeSavedMB || 0) - base);
       }, 0);
 
   const filterCounts = {
@@ -441,13 +540,17 @@ export default function ProductOptimization() {
     optimized: products.filter(p => !view(p).needsOptimization).length,
     no_alt_text: products.filter(p => p.imagesWithAlt === 0).length,
   };
+  const selectedRestorable = selectedProducts.filter(id => {
+    const p = products.find(x => x.id === id);
+    return p && view(p).optimizedImages > 0;
+  });
   const allSelected = selectedProducts.length === displayedProducts.length && displayedProducts.length > 0;
 
   const kpis = [
     { label: 'Products in catalog', value: stats.total.toLocaleString() },
     { label: 'Waiting to compress', value: stats.needsOptimization.toLocaleString(), tone: stats.needsOptimization > 0 ? 'warn' : undefined },
     { label: 'Product photos', value: stats.totalImages.toLocaleString() },
-    { label: 'Weight removed', value: formatBytes(liveSavings), tone: 'good' },
+    { label: 'Weight removed', value: formatBytes(Math.max(0, liveSavings)), tone: 'good' },
   ];
 
   return (
@@ -570,6 +673,7 @@ export default function ProductOptimization() {
               displayedProducts.map((raw) => {
                 const product = view(raw);
                 const isActive = activeId === product.id;
+                const toolHere = toolTask?.id === product.id ? toolTask.kind : null;
                 const selected = selectedProducts.includes(product.id);
                 const scoreTone = product.score >= 80 ? 'good' : product.score >= 60 ? 'warn' : 'bad';
                 return (
@@ -587,6 +691,7 @@ export default function ProductOptimization() {
                       <p className="pp-row-meta">
                         {`${product.status.toLowerCase()} · ${product.imageCount} images · alt text ${product.imagesWithAlt}/${product.imageCount}`}
                         {isActive && <span className="pp-live">Compressing</span>}
+                        {toolHere && <span className="pp-live">{TOOLS[toolHere].busy}</span>}
                       </p>
                     </div>
                     <div className="pp-row-progress">
@@ -601,6 +706,11 @@ export default function ProductOptimization() {
                       {`${product.score}%`}
                     </div>
                     <div className="pp-row-action">
+                      {product.optimizedImages > 0 && (
+                        <Button size="slim" variant="tertiary" onClick={() => setConfirmTool({ kind: 'restore', ids: [product.id] })} loading={toolHere === 'restore'} disabled={isBusy}>
+                          Restore
+                        </Button>
+                      )}
                       {product.needsOptimization ? (
                         <Button size="slim" variant="primary" onClick={() => handleOptimizeProduct(product.id)} loading={isActive} disabled={isBusy || quotaReached}>
                           Compress
@@ -622,12 +732,36 @@ export default function ProductOptimization() {
           <span>{`${selectedProducts.length} product${selectedProducts.length === 1 ? '' : 's'} selected`}</span>
           <div className="pp-bulkbar-actions">
             <button type="button" className="pp-btn pp-btn-glass" onClick={() => setSelectedProducts([])} disabled={isBusy}>Clear</button>
+            {selectedRestorable.length > 0 && (
+              <button type="button" className="pp-btn pp-btn-glass" onClick={() => setConfirmTool({ kind: 'restore', ids: selectedRestorable })} disabled={isBusy}>
+                {`Restore ${selectedRestorable.length}`}
+              </button>
+            )}
+            <button type="button" className="pp-btn pp-btn-glass" onClick={() => setConfirmTool({ kind: 'rename', ids: selectedProducts })} disabled={isBusy}>
+              SEO rename
+            </button>
             <button type="button" className="pp-btn pp-btn-white" onClick={handleOptimizeSelected} disabled={isBusy || quotaReached}>
-              {isBusy ? 'Compressing…' : 'Compress selected'}
+              {activeId ? 'Compressing…' : 'Compress selected'}
             </button>
           </div>
         </div>
       )}
+
+      <Modal
+        open={Boolean(confirmTool)}
+        onClose={() => setConfirmTool(null)}
+        title={confirmTool ? TOOLS[confirmTool.kind].title(confirmTool.ids.length) : ''}
+        primaryAction={confirmTool ? {
+          content: TOOLS[confirmTool.kind].label,
+          destructive: confirmTool.kind === 'restore',
+          onAction: handleConfirmTool,
+        } : undefined}
+        secondaryActions={[{ content: 'Cancel', onAction: () => setConfirmTool(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{confirmTool ? TOOLS[confirmTool.kind].body : ''}</Text>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }

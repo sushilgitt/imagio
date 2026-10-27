@@ -25,8 +25,8 @@ export default function App() {
           Lighter photos. Faster store. <em>More sales.</em>
         </h1>
         <p className={styles.text}>
-          Compression, AI alt text and speed testing for Shopify product photos — so your store looks
-          sharp and loads fast.
+          Compression, AI alt text and one-click restore for Shopify product photos — so your store
+          looks sharp and loads fast.
         </p>
         <p className={styles.note}>
           Get Imagio from the Shopify App Store, then open it from Apps in your Shopify admin.
@@ -39,7 +39,7 @@ export default function App() {
             <strong>Alt Writer</strong> AI describes each photo so shoppers and search engines know what is in it.
           </li>
           <li>
-            <strong>Speed Lab</strong> On-demand Lighthouse tests show how much faster your pages got.
+            <strong>Restore</strong> Put any product back to its original photos in one click.
           </li>
         </ul>
       </div>
