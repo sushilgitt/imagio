@@ -5,10 +5,11 @@ import { useLoaderData, useSubmit, useNavigation, useActionData, useFetcher, red
 import { authenticate } from '../shopify.server';
 import { getBillingStateCached } from '../billing.server';
 import { entitled } from '../plans.server';
+import { getPlanStatus, overLimitMessage } from '../limits.server';
 import { setDefaultResultOrder } from 'node:dns';
 import { fetchAllProducts, imageNodes, MAX_MEDIA_PER_PRODUCT } from '../catalog.server';
 
-// AI alt text is a Starter+ feature. Returns whether the shop's plan includes it;
+// AI alt text is a Shop+ feature. Returns whether the shop's plan includes it;
 // lets a re-auth Response propagate, treats other failures as not-entitled.
 async function altTextAllowed(admin, shop) {
   try {
@@ -121,7 +122,7 @@ const PRODUCTS_QUERY = `#graphql
 
 export async function loader({ request }) {
   const { admin, session } = await authenticate.admin(request);
-  // Tier boundary: AI alt text is Starter+. Free users go back to the app home.
+  // Tier boundary: AI alt text is Shop+. Free users go back to the app home.
   if (!(await altTextAllowed(admin, session.shop))) throw redirect('/app');
 
   try {
@@ -167,7 +168,7 @@ export async function action({ request }) {
   const { admin, session } = await authenticate.admin(request);
   // Tier boundary: block alt-text generation for non-entitled (Free) plans.
   if (!(await altTextAllowed(admin, session.shop))) {
-    return { error: 'Alt Writer is included with Starter and above.' };
+    return { error: 'AI alt text is included with Shop and above.' };
   }
   const formData = await request.formData();
   const actionType = formData.get('actionType');
@@ -243,6 +244,10 @@ export async function action({ request }) {
   // GEN_BATCH_SIZE chunks and calls this repeatedly, so every request stays
   // short (a few seconds) and can never time out — no matter how big the store.
   if (actionType === 'generateSuggestions') {
+    const status = await getPlanStatus(admin, session.shop);
+    if (!status.withinLimit) {
+      return { success: false, kind: 'suggestions', error: overLimitMessage(status) };
+    }
     try {
       const imagesData = JSON.parse(formData.get('images'));
       const aiProvider = formData.get('aiProvider') || 'openai';
@@ -648,7 +653,7 @@ export default function AltTextSuggestions() {
     >
       <Layout>
         <Layout.Section>
-          <PageHeader icon={MagicIcon} eyebrow="Alt Writer" title="AI alt text" subtitle="AI reads each product's main photo and writes one caption for all of its images" />
+          <PageHeader icon={MagicIcon} eyebrow="Alt text" title="Describe your photos" subtitle="AI reads each product's main photo and writes one description for all of its images" />
         </Layout.Section>
         {error && (
           <Layout.Section>
@@ -791,7 +796,7 @@ export default function AltTextSuggestions() {
 
                             <BlockStack gap="300">
                               <InlineStack gap="200" blockAlign="center">
-                                <Text variant="bodySm" as="p" fontWeight="semibold">Suggested by Alt Writer</Text>
+                                <Text variant="bodySm" as="p" fontWeight="semibold">AI suggestion</Text>
                                 <Text variant="bodySm" as="span" tone="subdued">(applied to all {image.imageCount} images)</Text>
                                 {image.status === 'applied' && <Badge tone="success">Applied</Badge>}
                               </InlineStack>
@@ -801,7 +806,7 @@ export default function AltTextSuggestions() {
                                 disabled={image.status === 'applied'}
                                 multiline={2}
                                 autoComplete="off"
-                                placeholder="Press 'Write suggestions' and Alt Writer will describe this photo…"
+                                placeholder="Press 'Write suggestions' and AI will describe this photo…"
                               />
                             </BlockStack>
 

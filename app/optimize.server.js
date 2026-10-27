@@ -5,10 +5,12 @@
 // webhook. Everything here runs server-side (uses sharp + node DNS).
 //
 // optimizeBatch processes ONE batch of a product's images per call and persists
-// per-image + summary metafields. Callers loop it until { done: true }. It also
-// enforces the per-shop monthly image quota: pass { shop, remainingQuota } and it
-// caps the batch, meters usage, and reports { quotaExceeded } when the cap is hit
-// with images still pending.
+// per-image + summary metafields. Callers loop it until { done: true }.
+//
+// Every replacement (compression here, restyling in studio.server.js) writes a
+// record `image_<new media id>` = { originalImageId, newImageId, … }, so the
+// records form a chain from the photo on the product back to the merchant's
+// original — which is what restoreProduct follows.
 import sharp from "sharp";
 import { setDefaultResultOrder } from "node:dns";
 import { incrementUsage } from "./usage.server";
@@ -141,7 +143,7 @@ export function seoBaseName(handle, position, optionValues = []) {
 
 // MediaImage id -> option values of the variants showing it. Budget:
 // 1 + variants(2 + 100 × (selectedOptions 1 + media 3)) ≈ 403.
-async function variantOptionsByMedia(admin, productId) {
+export async function variantOptionsByMedia(admin, productId) {
   const res = await admin.graphql(
     `#graphql
       query VariantOptions($id: ID!) {
@@ -183,7 +185,7 @@ function fileNameFromUrl(url) {
 }
 
 // Give every photo on a product its SEO name, in place — no re-encoding and no
-// credits. Keeps each file's extension; photos already named correctly are
+// plan limits. Keeps each file's extension; photos already named correctly are
 // left alone. Returns { success, productId, renamed, total, message }.
 export async function renameProductImages(admin, productId) {
   const res = await admin.graphql(
@@ -221,24 +223,38 @@ export async function renameProductImages(admin, productId) {
     files,
   ];
 
+  // A name can also be taken by a file elsewhere in the store (Shopify keeps
+  // file names unique). When a chunk fails, retry its files one by one and
+  // skip just the ones that clash.
+  const failed = new Set();
+  let lastErr = null;
   for (const pass of passes) {
     for (let i = 0; i < pass.length; i += 25) {
-      const err = await updateFiles(admin, pass.slice(i, i + 25));
-      if (err) {
-        return { success: false, productId, error: `Could not rename photos on "${product.title}": ${err}` };
+      const chunk = pass.slice(i, i + 25).filter((f) => !failed.has(f.id));
+      if ((await updateFiles(admin, chunk)) === null) continue;
+      for (const f of chunk) {
+        const err = await updateFiles(admin, [f]);
+        if (err) { failed.add(f.id); lastErr = err; }
       }
     }
+  }
+  const renamed = files.filter((f) => !failed.has(f.id)).length;
+  if (renamed === 0 && failed.size > 0) {
+    return { success: false, productId, error: `Could not rename photos on "${product.title}": ${lastErr}` };
   }
 
   return {
     success: true,
     productId,
     title: product.title,
-    renamed: files.length,
+    renamed,
+    skipped: failed.size,
     total: images.length,
-    message: files.length > 0
-      ? `Renamed ${files.length} photo(s) on "${product.title}"`
-      : `Photos on "${product.title}" already have SEO names`,
+    message: failed.size > 0
+      ? `Renamed ${renamed} photo(s) on "${product.title}" — ${failed.size} skipped because the name is already used by another file`
+      : files.length > 0
+        ? `Renamed ${files.length} photo(s) on "${product.title}"`
+        : `Photos on "${product.title}" already have SEO names`,
   };
 }
 
@@ -362,7 +378,7 @@ async function updateFiles(admin, files) {
   return json.errors?.[0]?.message || json.data?.fileUpdate?.userErrors?.[0]?.message || null;
 }
 
-async function deleteFiles(admin, fileIds) {
+export async function deleteFiles(admin, fileIds) {
   if (fileIds.length === 0) return;
   await admin.graphql(
     `#graphql
@@ -373,53 +389,41 @@ async function deleteFiles(admin, fileIds) {
   );
 }
 
-// Replace each original with its optimized copy while keeping the product
-// exactly as the merchant arranged it:
-//   1. wait for Shopify to process the copies; discard any that fail (the
-//      original stays on the product untouched),
-//   2. attach the copies to the product,
-//   3. point variants that used an original at its copy,
-//   4. detach the originals from this product only — the original files stay
-//      in Content › Files (a backup, and still intact anywhere else they're used),
-//   5. move each copy into its original's position (restores order + featured image).
-// `replacements` is [{ oldId, newId }]; `mediaOrder` is every media id on the
-// product (images, videos, models) in its original order.
-// Returns the Set of oldIds whose replacement was abandoned.
-async function finalizeReplacements(admin, productId, replacements, mediaOrder) {
-  const abandoned = new Set();
-  if (replacements.length === 0) return abandoned;
+// Every { variantId, mediaId } pair on a product (a variant shows at most one
+// photo). Paged, so products with more than 100 variants keep all their images.
+// Budget per page: 1 + variants(2 + 100 × (1 + media 3)) ≈ 403.
+async function variantMediaPairs(admin, productId) {
+  const pairs = [];
+  let cursor = null;
+  do {
+    const res = await admin.graphql(
+      `#graphql
+        query VariantMedia($id: ID!, $cursor: String) {
+          product(id: $id) {
+            variants(first: 100, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes { id media(first: 1) { nodes { id } } }
+            }
+          }
+        }`,
+      { variables: { id: productId, cursor } }
+    );
+    const json = await res.json();
+    const conn = json.data?.product?.variants;
+    if (!conn) throw new Error(json.errors?.[0]?.message || "Could not read variants");
+    for (const v of conn.nodes) {
+      const mediaId = v.media?.nodes?.[0]?.id;
+      if (mediaId) pairs.push({ variantId: v.id, mediaId });
+    }
+    cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+  } while (cursor);
+  return pairs;
+}
 
-  const { failed } = await waitForMediaReady(admin, replacements.map((r) => r.newId));
-  let good = replacements.filter((r) => !failed.has(r.newId));
-  for (const r of replacements) if (failed.has(r.newId)) abandoned.add(r.oldId);
-
-  const attachErr = await updateFiles(admin, good.map((r) => ({ id: r.newId, referencesToAdd: [productId] })));
-  if (attachErr) {
-    // Couldn't attach the copies — leave the product exactly as it was.
-    console.error(`[OPTIMIZE] attach copies to ${productId}:`, attachErr);
-    for (const r of good) abandoned.add(r.oldId);
-    good = [];
-  }
-  await deleteFiles(admin, replacements.filter((r) => abandoned.has(r.oldId)).map((r) => r.newId));
-  if (good.length === 0) return abandoned;
-
-  // Variants whose image is being replaced. Budget: 1 + variants(2 + 100 × 4) ≈ 403.
-  const newIdFor = new Map(good.map((r) => [r.oldId, r.newId]));
-  const varRes = await admin.graphql(
-    `#graphql
-      query VariantMedia($id: ID!) {
-        product(id: $id) {
-          variants(first: 100) { nodes { id media(first: 1) { nodes { id } } } }
-        }
-      }`,
-    { variables: { id: productId } }
-  );
-  const varJson = await varRes.json();
-  const variantMedia = (varJson.data?.product?.variants?.nodes || [])
-    .map((v) => ({ variantId: v.id, oldId: v.media?.nodes?.[0]?.id }))
-    .filter((v) => v.oldId && newIdFor.has(v.oldId))
-    .map((v) => ({ variantId: v.variantId, mediaIds: [newIdFor.get(v.oldId)] }));
-  if (variantMedia.length > 0) {
+// Point variants at new photos (100 pairs per call, Shopify's limit). The
+// variants must not hold a photo any more — detach the old one first.
+async function appendVariantMedia(admin, productId, variantMedia, tag) {
+  for (let i = 0; i < variantMedia.length; i += 100) {
     const res = await admin.graphql(
       `#graphql
         mutation AttachVariantMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
@@ -427,50 +431,198 @@ async function finalizeReplacements(admin, productId, replacements, mediaOrder) 
             userErrors { field message }
           }
         }`,
-      { variables: { productId, variantMedia } }
+      { variables: { productId, variantMedia: variantMedia.slice(i, i + 100) } }
     );
     const json = await res.json();
     const err = json.errors?.[0]?.message || json.data?.productVariantAppendMedia?.userErrors?.[0]?.message;
-    if (err) console.error(`[OPTIMIZE] variant media for ${productId}:`, err);
+    if (err) console.error(`[${tag}] variant media for ${productId}:`, err);
   }
+}
 
-  const detachErr = await updateFiles(admin, good.map((r) => ({ id: r.oldId, referencesToRemove: [productId] })));
-  if (detachErr) console.error(`[OPTIMIZE] detach originals from ${productId}:`, detachErr);
-
-  // Copies were appended at the end; move each into its original's slot.
-  // Applying moves in ascending target order lands every copy correctly.
-  const moves = good
-    .map((r) => ({ id: r.newId, newPosition: mediaOrder.indexOf(r.oldId) }))
+// Move each photo in `slots` ({ id, newPosition }) into place. Applying moves
+// in ascending target order lands every photo correctly.
+async function reorderMedia(admin, productId, slots, tag) {
+  const moves = slots
     .filter((m) => m.newPosition >= 0)
     .sort((a, b) => a.newPosition - b.newPosition)
     .map((m) => ({ id: m.id, newPosition: String(m.newPosition) }));
-  if (moves.length > 0) {
-    const res = await admin.graphql(
-      `#graphql
-        mutation RestoreMediaOrder($id: ID!, $moves: [MoveInput!]!) {
-          productReorderMedia(id: $id, moves: $moves) {
-            mediaUserErrors { field message }
-          }
-        }`,
-      { variables: { id: productId, moves } }
-    );
-    const json = await res.json();
-    const err = json.errors?.[0]?.message || json.data?.productReorderMedia?.mediaUserErrors?.[0]?.message;
-    if (err) console.error(`[OPTIMIZE] reorder media for ${productId}:`, err);
+  if (moves.length === 0) return;
+  const res = await admin.graphql(
+    `#graphql
+      mutation RestoreMediaOrder($id: ID!, $moves: [MoveInput!]!) {
+        productReorderMedia(id: $id, moves: $moves) {
+          mediaUserErrors { field message }
+        }
+      }`,
+    { variables: { id: productId, moves } }
+  );
+  const json = await res.json();
+  const err = json.errors?.[0]?.message || json.data?.productReorderMedia?.mediaUserErrors?.[0]?.message;
+  if (err) console.error(`[${tag}] reorder media for ${productId}:`, err);
+}
+
+// Replace each original with its optimized copy while keeping the product
+// exactly as the merchant arranged it:
+//   1. wait for Shopify to process the copies; discard any that fail (the
+//      original stays on the product untouched),
+//   2. attach the copies to the product,
+//   3. detach the originals from this product only — the original files stay
+//      in Content › Files (a backup, and still intact anywhere else they're
+//      used). This also clears them from their variants,
+//   4. point those variants at the copies,
+//   5. move each copy into its original's position (restores order + featured image).
+// Until step 3 succeeds nothing is lost: any failure before it rolls the copies
+// back off the product and deletes them, leaving the product as it was.
+// `replacements` is [{ oldId, newId }]; `mediaOrder` is every media id on the
+// product (images, videos, models) in its original order.
+// Returns the Set of oldIds whose replacement was abandoned.
+export async function finalizeReplacements(admin, productId, replacements, mediaOrder) {
+  const abandoned = new Set();
+  if (replacements.length === 0) return abandoned;
+
+  let good = [];
+  let pairs = [];
+  let attached = false;
+  try {
+    const { failed } = await waitForMediaReady(admin, replacements.map((r) => r.newId));
+    good = replacements.filter((r) => !failed.has(r.newId));
+
+    const attachErr = await updateFiles(admin, good.map((r) => ({ id: r.newId, referencesToAdd: [productId] })));
+    if (attachErr) throw new Error(`attach copies: ${attachErr}`);
+    attached = true;
+
+    // Read which variants show an original before detaching clears them.
+    pairs = good.length > 0 ? await variantMediaPairs(admin, productId) : [];
+
+    const detachErr = await updateFiles(admin, good.map((r) => ({ id: r.oldId, referencesToRemove: [productId] })));
+    if (detachErr) throw new Error(`detach originals: ${detachErr}`);
+  } catch (err) {
+    // Roll back: take the copies off the product (if they got on) and delete
+    // them. Originals that were detached in a partial failure are put back.
+    console.error(`[OPTIMIZE] swap on ${productId} failed, rolling back:`, err?.message || err);
+    try {
+      if (attached) {
+        await updateFiles(admin, good.map((r) => ({ id: r.oldId, referencesToAdd: [productId] })));
+        await updateFiles(admin, good.map((r) => ({ id: r.newId, referencesToRemove: [productId] })));
+      }
+      await deleteFiles(admin, replacements.map((r) => r.newId));
+    } catch (e) {
+      console.error(`[OPTIMIZE] rollback on ${productId}:`, e?.message || e);
+    }
+    for (const r of replacements) abandoned.add(r.oldId);
+    return abandoned;
   }
 
+  for (const r of replacements) if (!good.includes(r)) abandoned.add(r.oldId);
+  await deleteFiles(admin, replacements.filter((r) => abandoned.has(r.oldId)).map((r) => r.newId));
+  if (good.length === 0) return abandoned;
+
+  const newIdFor = new Map(good.map((r) => [r.oldId, r.newId]));
+  await appendVariantMedia(admin, productId, pairs
+    .filter((p) => newIdFor.has(p.mediaId))
+    .map((p) => ({ variantId: p.variantId, mediaIds: [newIdFor.get(p.mediaId)] })), "OPTIMIZE");
+
+  // Copies were appended at the end; move each into its original's slot.
+  await reorderMedia(admin, productId, good.map((r) => ({ id: r.newId, newPosition: mediaOrder.indexOf(r.oldId) })), "OPTIMIZE");
+
   return abandoned;
+}
+
+// Persist a batch of results and swap their copies onto the product.
+// `results` is [{ key, record, replacement? }] — replacement { oldId, newId }
+// when a copy was uploaded, none for photos that were only skipped.
+//
+// Records are written BEFORE the swap: if saving fails nothing is swapped (and
+// the uploaded copies are deleted), so a copy can never reach a product
+// without the record Restore needs to undo it. Records of swaps that were then
+// abandoned point at copies that never reached the product; they're removed.
+// Returns { kept, error } — kept are the results now in effect.
+export async function commitReplacements(admin, productId, results, mediaOrder, tag = "OPTIMIZE") {
+  if (results.length === 0) return { kept: [], error: null };
+  const copies = results.filter((r) => r.replacement).map((r) => r.replacement);
+
+  let saveErr = null;
+  for (let i = 0; i < results.length && !saveErr; i += 25) {
+    const res = await admin.graphql(
+      `#graphql
+        mutation CreateMetafields($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) { userErrors { field message } }
+        }`,
+      {
+        variables: {
+          metafields: results.slice(i, i + 25).map((r) => ({
+            ownerId: productId,
+            namespace: "image_optimization",
+            key: r.key,
+            type: "json",
+            value: JSON.stringify(r.record),
+          })),
+        },
+      }
+    );
+    const json = await res.json();
+    saveErr = json.errors?.[0]?.message || json.data?.metafieldsSet?.userErrors?.[0]?.message || null;
+  }
+  if (saveErr) {
+    console.error(`[${tag}] save records for ${productId}:`, saveErr);
+    await dropRecords(admin, productId, results.map((r) => r.key));
+    await deleteFiles(admin, copies.map((c) => c.newId));
+    return { kept: [], error: saveErr };
+  }
+
+  let abandoned;
+  try {
+    abandoned = await finalizeReplacements(admin, productId, copies, mediaOrder);
+  } catch (err) {
+    // finalizeReplacements rolls back its own failures; an exception here means
+    // the state is unknown — treat every swap as abandoned so nothing builds on it.
+    console.error(`[${tag}] finalize ${productId}:`, err?.message || err);
+    abandoned = new Set(copies.map((c) => c.oldId));
+  }
+  const dropped = results.filter((r) => r.replacement && abandoned.has(r.replacement.oldId));
+  if (dropped.length > 0) await dropRecords(admin, productId, dropped.map((r) => r.key));
+  return { kept: results.filter((r) => !dropped.includes(r)), error: null };
 }
 
 /* -------------------------------------------------------------------------- */
 /*  Restore — undo optimization, putting the original photos back             */
 /* -------------------------------------------------------------------------- */
 
+// Delete records (metafields) from a product, 25 per call. Returns the first
+// error message, or null.
+export async function dropRecords(admin, productId, keys) {
+  let firstErr = null;
+  for (let i = 0; i < keys.length; i += 25) {
+    const res = await admin.graphql(
+      `#graphql
+        mutation DropOptimizationRecords($metafields: [MetafieldIdentifierInput!]!) {
+          metafieldsDelete(metafields: $metafields) {
+            userErrors { field message }
+          }
+        }`,
+      {
+        variables: {
+          metafields: keys.slice(i, i + 25).map((key) => ({
+            ownerId: productId, namespace: "image_optimization", key,
+          })),
+        },
+      }
+    );
+    const json = await res.json();
+    const err = json.errors?.[0]?.message || json.data?.metafieldsDelete?.userErrors?.[0]?.message;
+    if (err && !firstErr) firstErr = err;
+  }
+  return firstErr;
+}
+
 // Reverse of finalizeReplacements for one product. Every "optimized" record
 // remembers { originalImageId, newImageId }; the original file was only
 // detached, so it is re-attached, variants are pointed back at it, it takes the
 // copy's position, and the copy is deleted. Records are then removed so the
 // product reads as never optimized. Usage is not refunded.
+//
+// Safe to re-run: records are only removed once the copies are off the
+// product, and a re-run finishes a restore whose original is already back.
 // Originals the merchant has since deleted from Files can't come back — those
 // copies stay on the product and their records are kept.
 // Returns { success, productId, restored, unavailable, message }.
@@ -481,7 +633,7 @@ export async function restoreProduct(admin, productId) {
         product(id: $id) {
           id
           title
-          media(first: 250) { nodes { id } }
+          media(first: 250) { nodes { id mediaContentType } }
           metafields(first: 250, namespace: "image_optimization") {
             nodes { key value }
           }
@@ -494,6 +646,7 @@ export async function restoreProduct(admin, productId) {
   if (!product) return { success: false, error: "Product not found", productId };
 
   const mediaOrder = product.media.nodes.map((n) => n.id);
+  const imageCount = product.media.nodes.filter((n) => n.mediaContentType === "IMAGE").length;
   const onProduct = new Set(mediaOrder);
   const records = [];
   for (const node of product.metafields.nodes) {
@@ -502,30 +655,50 @@ export async function restoreProduct(admin, productId) {
     catch { records.push({ key: node.key, rec: null }); }
   }
 
-  // Swaps still in place on the product: the copy is here, the original isn't.
-  const swaps = records
-    .filter(({ rec }) => rec?.status === "optimized" && rec.newImageId && rec.originalImageId)
-    .filter(({ rec }) => onProduct.has(rec.newImageId) && !onProduct.has(rec.originalImageId))
-    .map(({ key, rec }) => ({ key, oldId: rec.originalImageId, newId: rec.newImageId }));
+  // Follow each copy on the product back through its records to the
+  // merchant's original. (Studio collapses chains as it goes, so this is
+  // normally one step; longer chains come from older data.)
+  const byNew = new Map();
+  for (const r of records) {
+    if (r.rec?.status === "optimized" && r.rec.newImageId && r.rec.originalImageId) byNew.set(r.rec.newImageId, r);
+  }
+  const swaps = [];
+  for (const id of mediaOrder) {
+    if (!byNew.has(id)) continue;
+    const keys = [];
+    const between = [];
+    let cur = id;
+    while (byNew.has(cur) && keys.length < 20) {
+      const r = byNew.get(cur);
+      keys.push(r.key);
+      if (cur !== id) between.push(cur);
+      cur = r.rec.originalImageId;
+    }
+    // `back`: the original is already on the product (a restore that stopped
+    // half way) — only the copy needs to come off.
+    swaps.push({ keys, oldId: cur, newId: id, between, back: onProduct.has(cur) });
+  }
 
   // Only originals that still exist in Files (and are usable) can come back.
-  let restorable = [];
-  if (swaps.length > 0) {
+  const toCheck = swaps.filter((s) => !s.back).map((s) => s.oldId);
+  let ready = new Set();
+  if (toCheck.length > 0) {
     const res = await admin.graphql(
       `#graphql
         query OriginalFiles($ids: [ID!]!) {
           nodes(ids: $ids) { ... on MediaImage { id status } }
         }`,
-      { variables: { ids: swaps.map((s) => s.oldId) } }
+      { variables: { ids: toCheck } }
     );
     const json = await res.json();
-    const ready = new Set((json.data?.nodes || []).filter((n) => n?.status === "READY").map((n) => n.id));
-    restorable = swaps.filter((s) => ready.has(s.oldId));
+    ready = new Set((json.data?.nodes || []).filter((n) => n?.status === "READY").map((n) => n.id));
   }
-  const unavailable = new Set(swaps.filter((s) => !restorable.includes(s)).map((s) => s.key));
+  const restorable = swaps.filter((s) => s.back || ready.has(s.oldId));
+  const stuck = swaps.filter((s) => !restorable.includes(s));
 
   if (restorable.length > 0) {
-    const attachErr = await updateFiles(admin, restorable.map((s) => ({ id: s.oldId, referencesToAdd: [productId] })));
+    const attach = restorable.filter((s) => !s.back);
+    const attachErr = await updateFiles(admin, attach.map((s) => ({ id: s.oldId, referencesToAdd: [productId] })));
     if (attachErr) {
       // Nothing has changed on the product yet — stop and leave it as it is.
       console.error(`[RESTORE] attach originals to ${productId}:`, attachErr);
@@ -534,92 +707,41 @@ export async function restoreProduct(admin, productId) {
 
     // Variants showing a copy — read before the copies are detached.
     const oldIdFor = new Map(restorable.map((s) => [s.newId, s.oldId]));
-    const varRes = await admin.graphql(
-      `#graphql
-        query RestoreVariantMedia($id: ID!) {
-          product(id: $id) {
-            variants(first: 100) { nodes { id media(first: 1) { nodes { id } } } }
-          }
-        }`,
-      { variables: { id: productId } }
-    );
-    const varJson = await varRes.json();
-    const variantMedia = (varJson.data?.product?.variants?.nodes || [])
-      .map((v) => ({ variantId: v.id, newId: v.media?.nodes?.[0]?.id }))
-      .filter((v) => v.newId && oldIdFor.has(v.newId))
-      .map((v) => ({ variantId: v.variantId, mediaIds: [oldIdFor.get(v.newId)] }));
+    const pairs = await variantMediaPairs(admin, productId);
 
     // Detaching the copies also clears them from their variants.
     const detachErr = await updateFiles(admin, restorable.map((s) => ({ id: s.newId, referencesToRemove: [productId] })));
-    if (detachErr) console.error(`[RESTORE] detach copies from ${productId}:`, detachErr);
-
-    if (variantMedia.length > 0) {
-      const res = await admin.graphql(
-        `#graphql
-          mutation RestoreVariantImages($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
-            productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
-              userErrors { field message }
-            }
-          }`,
-        { variables: { productId, variantMedia } }
-      );
-      const json = await res.json();
-      const err = json.errors?.[0]?.message || json.data?.productVariantAppendMedia?.userErrors?.[0]?.message;
-      if (err) console.error(`[RESTORE] variant media for ${productId}:`, err);
+    if (detachErr) {
+      // Originals and copies are both on the product now. Keep every record so
+      // running Restore again finishes the job (the originals count as `back`).
+      console.error(`[RESTORE] detach copies from ${productId}:`, detachErr);
+      return { success: false, productId, error: `Restore of "${product.title}" did not finish (${detachErr}). Run Restore again.` };
     }
+
+    await appendVariantMedia(admin, productId, pairs
+      .filter((p) => oldIdFor.has(p.mediaId))
+      .map((p) => ({ variantId: p.variantId, mediaIds: [oldIdFor.get(p.mediaId)] })), "RESTORE");
 
     // Originals were appended at the end; move each into its copy's slot.
-    const moves = restorable
-      .map((s) => ({ id: s.oldId, newPosition: mediaOrder.indexOf(s.newId) }))
-      .filter((m) => m.newPosition >= 0)
-      .sort((a, b) => a.newPosition - b.newPosition)
-      .map((m) => ({ id: m.id, newPosition: String(m.newPosition) }));
-    if (moves.length > 0) {
-      const res = await admin.graphql(
-        `#graphql
-          mutation RestoreOriginalOrder($id: ID!, $moves: [MoveInput!]!) {
-            productReorderMedia(id: $id, moves: $moves) {
-              mediaUserErrors { field message }
-            }
-          }`,
-        { variables: { id: productId, moves } }
-      );
-      const json = await res.json();
-      const err = json.errors?.[0]?.message || json.data?.productReorderMedia?.mediaUserErrors?.[0]?.message;
-      if (err) console.error(`[RESTORE] reorder media for ${productId}:`, err);
-    }
+    await reorderMedia(admin, productId,
+      attach.map((s) => ({ id: s.oldId, newPosition: mediaOrder.indexOf(s.newId) })), "RESTORE");
 
     // The copies are Imagio's own files; once detached, nothing needs them.
-    if (!detachErr) await deleteFiles(admin, restorable.map((s) => s.newId));
+    await deleteFiles(admin, restorable.flatMap((s) => [s.newId, ...s.between]));
   }
 
-  // Drop every record except swaps that couldn't be undone, so the product
-  // shows as unoptimized (and can be compressed again later).
-  const kept = records.filter(({ key }) => unavailable.has(key));
-  const dropKeys = records.filter(({ key }) => !unavailable.has(key)).map(({ key }) => key);
-  if (kept.length === 0) dropKeys.push("optimization_summary");
-  for (let i = 0; i < dropKeys.length; i += 25) {
-    const res = await admin.graphql(
-      `#graphql
-        mutation DropOptimizationRecords($metafields: [MetafieldIdentifierInput!]!) {
-          metafieldsDelete(metafields: $metafields) {
-            userErrors { field message }
-          }
-        }`,
-      {
-        variables: {
-          metafields: dropKeys.slice(i, i + 25).map((key) => ({
-            ownerId: productId, namespace: "image_optimization", key,
-          })),
-        },
-      }
-    );
-    const json = await res.json();
-    const err = json.errors?.[0]?.message || json.data?.metafieldsDelete?.userErrors?.[0]?.message;
-    if (err) console.error(`[RESTORE] drop records for ${productId}:`, err);
-  }
-  if (kept.length > 0) {
-    await writeSummary(admin, productId, mediaOrder.length, kept.map(({ rec }) => rec).filter(Boolean));
+  // Drop every record except the chains that couldn't be undone, so the
+  // product shows as unoptimized (and can be processed again later).
+  const keep = new Set(stuck.flatMap((s) => s.keys));
+  const dropKeys = records.filter(({ key }) => !keep.has(key)).map(({ key }) => key);
+  if (keep.size === 0) dropKeys.push("optimization_summary");
+  const dropErr = await dropRecords(admin, productId, dropKeys);
+  if (dropErr) console.error(`[RESTORE] drop records for ${productId}:`, dropErr);
+  if (stuck.length > 0) {
+    // The summary counts only the copies still on the product (chain heads).
+    const heads = new Set(stuck.map((s) => s.keys[0]));
+    await writeSummary(admin, productId, imageCount,
+      records.filter(({ key }) => heads.has(key)).map(({ rec }) => rec));
   }
 
   return {
@@ -627,9 +749,9 @@ export async function restoreProduct(admin, productId) {
     productId,
     title: product.title,
     restored: restorable.length,
-    unavailable: unavailable.size,
-    message: unavailable.size > 0
-      ? `Restored ${restorable.length} photo(s) on "${product.title}" — ${unavailable.size} original(s) were deleted from Files and can't come back`
+    unavailable: stuck.length,
+    message: stuck.length > 0
+      ? `Restored ${restorable.length} photo(s) on "${product.title}" — ${stuck.length} original(s) were deleted from Files and can't come back`
       : `Restored "${product.title}" to its original photos`,
   };
 }
@@ -715,13 +837,12 @@ export async function writeSummary(admin, productId, totalImages, records) {
 /* -------------------------------------------------------------------------- */
 
 // opts:
-//   shop           — when set, optimized images are metered via incrementUsage
-//   remainingQuota — max images this call may optimize (default: unlimited).
-//                    When 0 with images still pending, returns { quotaExceeded }.
-//   genAlt         — generate AI alt text for images missing it (default true).
-//                    Pass false for plans without the alt-text entitlement (Free).
+//   shop   — when set, optimized images are counted via incrementUsage (a stat)
+//   genAlt — generate AI alt text for images missing it (default true).
+//            Pass false for plans without the alt-text entitlement (Free).
+// Plan limits are checked by the caller (see limits.server.js).
 export async function optimizeBatch(admin, productId, opts = {}) {
-  const { shop = null, remainingQuota = Infinity, genAlt = true } = opts;
+  const { shop = null, genAlt = true } = opts;
 
   // Query current media (MediaImage gids) + existing optimization metafields.
   const response = await admin.graphql(
@@ -753,15 +874,19 @@ export async function optimizeBatch(admin, productId, opts = {}) {
     .map(n => ({ id: n.id, url: n.image.url, altText: n.image.altText }));
   const total = images.length;
 
-  // Parse existing per-image records and the set of already-processed media ids.
+  // Records for photos currently on the product, keyed by numeric media id.
+  // Records of copies that were since replaced again (e.g. a compressed copy
+  // restyled in the Studio) are history kept for Restore, not current state.
+  const onProduct = new Set(images.map(img => img.id.split("/").pop()));
   const records = [];
   const doneIds = new Set();
   for (const e of product.metafields.edges) {
     if (!e.node.key.startsWith("image_")) continue;
+    const id = e.node.key.slice("image_".length);
+    if (!onProduct.has(id)) continue;
     try {
-      const rec = JSON.parse(e.node.value);
-      records.push(rec);
-      doneIds.add(e.node.key.slice("image_".length));
+      records.push(JSON.parse(e.node.value));
+      doneIds.add(id);
     } catch { /* ignore malformed */ }
   }
 
@@ -772,23 +897,7 @@ export async function optimizeBatch(admin, productId, opts = {}) {
   }
 
   const pending = images.filter(img => !doneIds.has(img.id.split("/").pop()));
-
-  // Quota exhausted but images still need work — stop and signal the caller.
-  if (pending.length > 0 && remainingQuota <= 0) {
-    const processedNow = Math.min(records.length, total);
-    return {
-      success: true, productId, title: product.title, total,
-      optimized: processedNow, remaining: total - processedNow,
-      advanced: false, done: false, quotaExceeded: true,
-      score: total > 0 ? Math.round((processedNow / total) * 100) : 0,
-      sizeSavedMB: 0, originalSizeMB: 0, optimizedSizeMB: 0, compressionRate: 0,
-      message: "Monthly credits used up",
-    };
-  }
-
-  // Cap the batch to both the per-call batch size and the remaining quota.
-  const cap = Math.max(0, Math.min(BATCH_SIZE, remainingQuota));
-  const batch = pending.slice(0, cap);
+  const batch = pending.slice(0, BATCH_SIZE);
   const options = batch.length > 0 ? await variantOptionsByMedia(admin, productId) : new Map();
 
   // Process this batch in parallel. Each result is a per-image metafield record.
@@ -806,7 +915,7 @@ export async function optimizeBatch(admin, productId, opts = {}) {
         };
       }
 
-      // Auto alt text is a Starter+ feature; Free plans (genAlt=false) keep the
+      // Auto alt text is a Shop+ feature; Free plans (genAlt=false) keep the
       // image's existing alt and skip AI generation.
       let altText = image.altText;
       if (genAlt && (!altText || altText.length < 10)) {
@@ -838,40 +947,11 @@ export async function optimizeBatch(admin, productId, opts = {}) {
     }
   })).filter(Boolean);
 
-  // Swap originals for copies in one pass, preserving order, featured image and
-  // variant images. Copies Shopify failed to process are dropped (originals kept).
-  let abandoned = new Set();
-  try {
-    abandoned = await finalizeReplacements(
-      admin, productId, batchResults.filter(r => r.replacement).map(r => r.replacement), mediaOrder
-    );
-  } catch (err) {
-    console.error(`[OPTIMIZE] finalize ${productId}:`, err?.message || err);
-  }
-  const newRecords = batchResults.filter(r => !(r.replacement && abandoned.has(r.replacement.oldId)));
+  // Record, then swap (see commitReplacements). Failures stay pending.
+  const { kept: newRecords, error: commitError } = await commitReplacements(admin, productId, batchResults, mediaOrder);
+  if (commitError) return { success: false, productId, error: `Could not save progress on "${product.title}": ${commitError}` };
 
-  // Persist the per-image metafields written this batch (up to 25 per call).
-  if (newRecords.length > 0) {
-    await admin.graphql(
-      `#graphql
-        mutation CreateMetafields($metafields: [MetafieldsSetInput!]!) {
-          metafieldsSet(metafields: $metafields) { userErrors { field message } }
-        }`,
-      {
-        variables: {
-          metafields: newRecords.map(r => ({
-            ownerId: productId,
-            namespace: "image_optimization",
-            key: r.key,
-            type: "json",
-            value: JSON.stringify(r.record),
-          })),
-        },
-      }
-    );
-  }
-
-  // Meter only images that were actually re-encoded (not skipped) against quota.
+  // Count only images that were actually re-encoded (not skipped).
   const optimizedCount = newRecords.filter(r => r.record.status === "optimized").length;
   if (shop && optimizedCount > 0) {
     try { await incrementUsage(shop, optimizedCount); }
@@ -884,8 +964,6 @@ export async function optimizeBatch(admin, productId, opts = {}) {
   const processed = Math.min(totals.processed, total);
   const remaining = total - processed;
   const advanced = newRecords.length > 0;
-  // We hit the quota cap (not the batch-size cap) yet images still remain.
-  const quotaExceeded = remaining > 0 && cap < BATCH_SIZE;
 
   return {
     success: true,
@@ -896,7 +974,6 @@ export async function optimizeBatch(admin, productId, opts = {}) {
     remaining,
     advanced,
     done: remaining === 0,
-    quotaExceeded,
     score: total > 0 ? Math.round((processed / total) * 100) : 0,
     sizeSavedMB: totals.totalSizeSavedMB,
     originalSizeMB: totals.totalOriginalSizeMB,

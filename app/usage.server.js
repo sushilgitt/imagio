@@ -1,9 +1,9 @@
-// Per-shop monthly image-usage metering.
+// Per-shop monthly usage metering.
 //
-// Plan quotas (see plans.server.js) are enforced against a counter that resets
-// each calendar month. Usage is keyed by shop + period ("YYYY-MM"), so a fresh
-// row is created at the start of every month and the previous month's count is
-// preserved for reference.
+// Counters are keyed by shop + period ("YYYY-MM"), so a fresh row is created at
+// the start of every month and the previous month's counts are preserved for
+// reference. `imagesUsed` is informational (plans are priced by catalog size);
+// `bgRemovals` is enforced against the plan's monthlyBgRemovals.
 import db from "./db.server";
 import { FREE_PLAN } from "./plans.server";
 
@@ -16,32 +16,40 @@ export function currentPeriod() {
   return `${y}-${m}`;
 }
 
-// Read this shop's usage for the current period. Returns { period, imagesUsed }
-// without creating a row (a missing row means zero used).
+// Read this shop's usage for the current period without creating a row (a
+// missing row means zero used). Returns { period, imagesUsed, bgRemovals }.
 export async function getUsage(shop) {
   const period = currentPeriod();
   const row = await db.usageCounter.findUnique({
     where: { shop_period: { shop, period } },
   });
-  return { period, imagesUsed: row?.imagesUsed ?? 0 };
+  return { period, imagesUsed: row?.imagesUsed ?? 0, bgRemovals: row?.bgRemovals ?? 0 };
 }
 
-// Atomically add `n` to this shop's current-period counter, creating the row on
-// first use. No-op for n <= 0. Returns the new total.
-export async function incrementUsage(shop, n) {
-  if (!n || n <= 0) return (await getUsage(shop)).imagesUsed;
+// Atomically add `n` to one of this shop's current-period counters, creating
+// the row on first use. No-op for n <= 0. Returns the new total.
+async function increment(shop, field, n) {
+  if (!n || n <= 0) return (await getUsage(shop))[field];
   const period = currentPeriod();
   const row = await db.usageCounter.upsert({
     where: { shop_period: { shop, period } },
-    create: { shop, period, imagesUsed: n },
-    update: { imagesUsed: { increment: n } },
+    create: { shop, period, [field]: n },
+    update: { [field]: { increment: n } },
   });
-  return row.imagesUsed;
+  return row[field];
 }
 
-// Images this shop may still optimize this month under `plan` (>= 0).
-export async function getRemaining(shop, plan) {
-  const quota = (plan || FREE_PLAN).monthlyImages;
-  const { imagesUsed } = await getUsage(shop);
-  return Math.max(0, quota - imagesUsed);
+export function incrementUsage(shop, n) {
+  return increment(shop, "imagesUsed", n);
+}
+
+export function incrementBgRemovals(shop, n) {
+  return increment(shop, "bgRemovals", n);
+}
+
+// Background removals this shop may still run this month under `plan` (>= 0).
+export async function getBgRemovalsLeft(shop, plan) {
+  const allowance = (plan || FREE_PLAN).monthlyBgRemovals;
+  const { bgRemovals } = await getUsage(shop);
+  return Math.max(0, allowance - bgRemovals);
 }

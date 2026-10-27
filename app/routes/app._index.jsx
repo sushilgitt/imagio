@@ -1,30 +1,26 @@
 import { useNavigate, useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
-import { getBillingStateCached } from "../billing.server";
 import { getUsage } from "../usage.server";
 import { entitled } from "../plans.server";
+import { getPlanStatus } from "../limits.server";
 import db from "../db.server";
 import { Page, Button, Badge, Icon } from "@shopify/polaris";
 import {
+  HeartIcon,
+  PaintBrushFlatIcon,
   ImageMagicIcon,
   MagicIcon,
   AutomationIcon,
   PlanIcon,
   ImagesIcon,
-  CheckCircleIcon,
+  ProductIcon,
 } from "@shopify/polaris-icons";
 import { BrandMark, Mosaic, PixelMeter } from "../components/Pixels";
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
-
-  let plan = null;
-  try {
-    plan = (await getBillingStateCached(admin, session.shop)).plan;
-  } catch (e) {
-    if (e instanceof Response) throw e; // let re-auth propagate
-  }
+  const status = await getPlanStatus(admin, session.shop);
 
   let usage = { imagesUsed: 0 };
   let autoOptimize = false;
@@ -36,11 +32,15 @@ export const loader = async ({ request }) => {
 
   return {
     plan: {
-      name: plan?.name || "Free",
-      tier: plan?.tier || "free",
-      monthlyImages: plan?.monthlyImages ?? 100,
-      altText: entitled(plan, "altText"),
-      autoOptimizeAllowed: entitled(plan, "autoOptimize"),
+      name: status.plan.name,
+      tier: status.plan.tier,
+      maxProducts: status.maxProducts,
+      productCount: status.productCount,
+      withinLimit: status.withinLimit,
+      suggestedPlan: status.suggestedPlan,
+      altText: entitled(status.plan, "altText"),
+      studio: entitled(status.plan, "studio"),
+      autoOptimizeAllowed: entitled(status.plan, "autoOptimize"),
     },
     usage,
     autoOptimize,
@@ -51,41 +51,55 @@ export default function Index() {
   const navigate = useNavigate();
   const { plan, usage, autoOptimize } = useLoaderData();
 
-  const quota = plan.monthlyImages || 0;
-  const used = usage?.imagesUsed || 0;
-  const remaining = Math.max(0, quota - used);
-  const pct = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0;
   const fmt = (n) => Number(n).toLocaleString();
+  const pct = plan.maxProducts > 0 ? Math.min(100, Math.round((plan.productCount / plan.maxProducts) * 100)) : 100;
 
   const autoStatus = !plan.autoOptimizeAllowed
-    ? { label: "Growth plan", tone: "attention" }
+    ? { label: "Brand plan", tone: "attention" }
     : autoOptimize
       ? { label: "Running", tone: "success" }
       : { label: "Paused", tone: undefined };
 
   const tools = [
     {
+      icon: HeartIcon,
+      title: "Photo health",
+      desc: "Score every product photo for weight, alt text, file names, shape, resolution and duplicates — then fix each issue in one click.",
+      cta: "Run the check",
+      onClick: () => navigate("/app/audit"),
+      available: true,
+    },
+    {
+      icon: PaintBrushFlatIcon,
+      title: "Studio",
+      desc: "Give every photo the same shape, padding and background, centred on the product. Preview before you apply.",
+      cta: plan.studio ? "Open Studio" : "Unlock with Shop",
+      onClick: () => navigate(plan.studio ? "/app/studio" : "/app/plan"),
+      available: plan.studio,
+      badge: plan.studio ? undefined : { label: "Shop+", tone: "attention" },
+    },
+    {
       icon: ImageMagicIcon,
-      title: "Compress",
-      desc: "Re-encode product photos as lean WebP files and swap them in place — same look, a fraction of the weight.",
-      cta: "Start compressing",
+      title: "Compress & restore",
+      desc: "Lean WebP files with search-friendly names, replaced on the product. Changed your mind? Restore the originals in one click.",
+      cta: "Open Compress",
       onClick: () => navigate("/app/optimize"),
       available: true,
     },
     {
       icon: MagicIcon,
-      title: "Alt Writer",
-      desc: "AI looks at each product photo and writes descriptive, search-friendly alt text you can apply in bulk.",
-      cta: plan.altText ? "Write alt text" : "Unlock with Starter",
+      title: "Alt text",
+      desc: "AI describes each product's main photo so shoppers using screen readers and image search know what it shows.",
+      cta: plan.altText ? "Write alt text" : "Unlock with Shop",
       onClick: () => navigate(plan.altText ? "/app/alt-text" : "/app/plan"),
       available: plan.altText,
-      badge: plan.altText ? undefined : { label: "Starter+", tone: "attention" },
+      badge: plan.altText ? undefined : { label: "Shop+", tone: "attention" },
     },
     {
       icon: AutomationIcon,
       title: "Autopilot",
-      desc: "New products get compressed automatically the moment they are created — nothing to remember.",
-      cta: plan.autoOptimizeAllowed ? "Configure" : "Unlock with Growth",
+      desc: "New products get your Studio style — or plain compression — the moment they are created.",
+      cta: plan.autoOptimizeAllowed ? "Configure" : "Unlock with Brand",
       onClick: () => navigate(plan.autoOptimizeAllowed ? "/app/optimize" : "/app/plan"),
       available: plan.autoOptimizeAllowed,
       badge: autoStatus,
@@ -93,15 +107,15 @@ export default function Index() {
   ];
 
   const steps = [
-    { title: "Pick your products", desc: "Open Compress and choose the products with the heaviest photos." },
-    { title: "Click Compress", desc: "Photos become lean WebP files, swapped in place on each product." },
-    { title: "Enjoy a faster store", desc: "Lighter pages load quicker — and any product can be restored to its original photos." },
+    { title: "Check your photos", desc: "Photo health scores your whole catalog and lists exactly what to fix." },
+    { title: "Fix in one click", desc: "Restyle in Studio, compress, rename and caption — product by product or all at once." },
+    { title: "Undo anything", desc: "Every change keeps the original in Files, and Restore puts it back exactly as it was." },
   ];
 
   const stats = [
     { icon: PlanIcon, label: "Plan", value: plan.name },
-    { icon: ImagesIcon, label: "Compressed this month", value: fmt(used) },
-    { icon: CheckCircleIcon, label: "Credits left", value: fmt(remaining) },
+    { icon: ProductIcon, label: "Products covered", value: `${fmt(plan.productCount)} / ${fmt(plan.maxProducts)}` },
+    { icon: ImagesIcon, label: "Photos improved this month", value: fmt(usage?.imagesUsed || 0) },
     { icon: AutomationIcon, label: "Autopilot", value: autoStatus.label },
   ];
 
@@ -111,15 +125,15 @@ export default function Index() {
         <div className="pp-hero-main">
           <p className="pp-kicker"><BrandMark />IMAGIO</p>
           <h1>
-            Lighter photos. Faster store. <em>More sales.</em>
+            Product photos that look like <em>one brand.</em>
           </h1>
           <p className="pp-hero-sub">
-            Shrink product photos to WebP, give every image meaningful alt text, and watch your
-            storefront get quicker — all from one simple dashboard.
+            Find what is wrong with your product photos, make them consistent in one click, and keep
+            them light and search-friendly — with a one-click undo for every change.
           </p>
           <div className="pp-actions">
-            <button type="button" className="pp-btn pp-btn-primary" onClick={() => navigate("/app/optimize")}>
-              Compress images
+            <button type="button" className="pp-btn pp-btn-primary" onClick={() => navigate("/app/audit")}>
+              Check photo health
             </button>
             <button type="button" className="pp-btn pp-btn-outline" onClick={() => navigate("/app/plan")}>
               View plan
@@ -131,14 +145,18 @@ export default function Index() {
         <div className="pp-usage-card">
           <Mosaic />
           <div>
-            <p className="pp-usage-label">{`${plan.name} · this month`}</p>
+            <p className="pp-usage-label">{`${plan.name} plan`}</p>
             <p className="pp-usage-big">
-              {fmt(used)}<span>{` / ${fmt(quota)}`}</span>
+              {fmt(plan.productCount)}<span>{` / ${fmt(plan.maxProducts)}`}</span>
             </p>
-            <p className="pp-usage-foot">images compressed</p>
+            <p className="pp-usage-foot">products covered</p>
           </div>
-          <PixelMeter pct={pct} label={`${pct}% of monthly images used`} />
-          <p className="pp-usage-foot">{`${fmt(remaining)} credits left · resets on the 1st`}</p>
+          <PixelMeter pct={pct} label={`${pct}% of your plan's product limit`} />
+          <p className="pp-usage-foot">
+            {plan.withinLimit
+              ? "Every feature on your plan is unlocked"
+              : `Catalog outgrew ${plan.name} — upgrade to ${plan.suggestedPlan}`}
+          </p>
         </div>
       </section>
 

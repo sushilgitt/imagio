@@ -22,24 +22,24 @@ export default function App() {
           Imagio
         </p>
         <h1 className={styles.heading}>
-          Lighter photos. Faster store. <em>More sales.</em>
+          Product photos that look like <em>one brand.</em>
         </h1>
         <p className={styles.text}>
-          Compression, AI alt text and one-click restore for Shopify product photos — so your store
-          looks sharp and loads fast.
+          Imagio checks every Shopify product photo, makes them consistent in one click and keeps them
+          light and search-friendly — with a one-click undo for every change.
         </p>
         <p className={styles.note}>
           Get Imagio from the Shopify App Store, then open it from Apps in your Shopify admin.
         </p>
         <ul className={styles.list}>
           <li>
-            <strong>Compress</strong> Product photos become lean WebP files, replaced right on the product.
+            <strong>Photo health</strong> A catalog score for weight, alt text, file names, shape, resolution and duplicates.
           </li>
           <li>
-            <strong>Alt Writer</strong> AI describes each photo so shoppers and search engines know what is in it.
+            <strong>Studio</strong> Same shape, padding and background on every photo, centred on the product.
           </li>
           <li>
-            <strong>Restore</strong> Put any product back to its original photos in one click.
+            <strong>Compress &amp; restore</strong> Lean WebP files with SEO names, and the originals back in one click.
           </li>
         </ul>
       </div>

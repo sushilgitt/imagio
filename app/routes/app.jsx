@@ -19,15 +19,16 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
   // Free-tier defaults; refined from the live subscription below.
-  let features = { altText: false };
+  let features = { altText: false, studio: false };
   try {
     // Subscription state decides which features unlock. Cached per-shop
     // (positive results only) so paying merchants don't pay a Shopify roundtrip
     // on every click; a fresh subscribe still unlocks instantly.
     const state = await getBillingStateCached(admin, session.shop);
-    // Entitlement booleans drive which nav items render (Alt Text).
+    // Entitlement booleans drive which nav items render (Studio, Alt Text).
     features = {
       altText: entitled(state.plan, "altText"),
+      studio: entitled(state.plan, "studio"),
     };
   } catch (e) {
     // Propagate redirect Responses (e.g. OAuth flow initiated by the library),
@@ -74,9 +75,13 @@ export default function App() {
             tier (see getBillingState), and upgrades happen from the Plan page. */}
         <ui-nav-menu>
           <a href="/app" rel="home">Overview</a>
+          <a href="/app/audit">Photo health</a>
           <a href="/app/optimize">Compress</a>
+          {features?.studio && (
+            <a href="/app/studio">Studio</a>
+          )}
           {features?.altText && (
-            <a href="/app/alt-text">Alt Writer</a>
+            <a href="/app/alt-text">Alt text</a>
           )}
           <a href="/app/plan">Plan</a>
         </ui-nav-menu>

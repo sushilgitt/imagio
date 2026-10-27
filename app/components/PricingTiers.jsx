@@ -20,8 +20,8 @@ export default function PricingTiers({ pricingUrl }) {
           Pick the plan that fits <em>your catalog.</em>
         </h1>
         <p>
-          Lighter product photos, descriptive alt text and quicker pages. Start on Free and move up
-          whenever you need more credits.
+          Consistent, fast, search-friendly product photos — priced by catalog size, not per image. Start on Free and move up
+          whenever your catalog grows.
         </p>
       </header>
 

@@ -7,8 +7,11 @@ import {
   managedPricingUrl,
   appBridgeRedirect,
   cancelSubscription,
+  clearBillingCache,
 } from "../billing.server";
 import { getUsage } from "../usage.server";
+import { getProductCount } from "../limits.server";
+import { FREE_PLAN } from "../plans.server";
 import { PLAN_TIERS } from "../planCatalog";
 import { Page, Layout, BlockStack, Banner } from "@shopify/polaris";
 import { boundary } from "@shopify/shopify-app-react-router/server";
@@ -16,9 +19,11 @@ import { Mosaic, PixelMeter } from "../components/Pixels";
 
 // Human labels for the entitlement flags, shown as the current plan's inclusions.
 const FEATURE_LABELS = {
-  optimize: "WebP compression",
-  altText: "Alt Writer (AI alt text)",
-  autoOptimize: "Autopilot for new products",
+  optimize: "WebP compression, restore and SEO file names",
+  altText: "AI alt text",
+  studio: "Photo studio: crop, padding, white background",
+  bgRemoval: "AI background removal",
+  autoOptimize: "Autopilot: new products styled automatically",
 };
 
 export const loader = async ({ request }) => {
@@ -31,19 +36,23 @@ export const loader = async ({ request }) => {
     if (e instanceof Response) throw e;
   }
 
-  let usage = { imagesUsed: 0 };
+  let usage = { imagesUsed: 0, bgRemovals: 0 };
   try { usage = await getUsage(session.shop); } catch { /* table not ready */ }
+  const productCount = await getProductCount(admin, session.shop);
 
-  const plan = state.plan || { name: "Free", tier: "free", monthlyImages: 100, features: {} };
+  const plan = state.plan || FREE_PLAN;
   const included = Object.keys(FEATURE_LABELS).filter((k) => plan.features?.[k]);
 
   return {
     hasActivePlan: state.hasActivePlan,
     planName: plan.name,
     tier: plan.tier,
-    monthlyImages: plan.monthlyImages,
+    maxProducts: plan.maxProducts,
+    monthlyBgRemovals: plan.monthlyBgRemovals,
+    productCount,
     included,
     imagesUsed: usage.imagesUsed || 0,
+    bgRemovals: usage.bgRemovals || 0,
     // Direct top-frame link target for the Change/Choose-plan CTA.
     pricingUrl: managedPricingUrl(session.shop, state.appHandle),
   };
@@ -64,6 +73,7 @@ export const action = async ({ request }) => {
     if (!sub) return { cancelled: true };
     try {
       await cancelSubscription(admin, sub.id);
+      clearBillingCache(session.shop);
       return { cancelled: true };
     } catch (e) {
       console.error("[BILLING] in-app cancel failed, redirecting:", e?.message);
@@ -75,7 +85,10 @@ export const action = async ({ request }) => {
 };
 
 export default function BillingPage() {
-  const { hasActivePlan, planName, monthlyImages, included, imagesUsed, pricingUrl } = useLoaderData();
+  const {
+    hasActivePlan, planName, maxProducts, monthlyBgRemovals, productCount,
+    included, imagesUsed, bgRemovals, pricingUrl,
+  } = useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
   const submit = useSubmit();
@@ -87,9 +100,8 @@ export default function BillingPage() {
     submit(fd, { method: "post" });
   };
 
-  const quota = monthlyImages || 0;
-  const used = imagesUsed || 0;
-  const pct = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0;
+  const pct = maxProducts > 0 ? Math.min(100, Math.round((productCount / maxProducts) * 100)) : 100;
+  const overLimit = productCount > maxProducts;
   const fmt = (n) => Number(n).toLocaleString();
   const currentIdx = PLAN_TIERS.findIndex((t) => t.name === planName);
 
@@ -97,13 +109,13 @@ export default function BillingPage() {
     <Page>
       <Layout>
         <Layout.Section>
-          <PageHeader icon={CreditCardIcon} eyebrow="Your account" title="Plan" subtitle="What you're on, how many credits you've used, and what's unlocked" />
+          <PageHeader icon={CreditCardIcon} eyebrow="Your account" title="Plan" subtitle="What you're on, how much of your catalog it covers, and what's unlocked" />
         </Layout.Section>
 
         {actionData?.cancelled && !hasActivePlan && (
           <Layout.Section>
             <Banner title="Plan cancelled" tone="info">
-              Your subscription has ended. Pick a plan whenever you're ready for more credits.
+              Your subscription has ended. Pick a plan whenever your catalog needs one.
             </Banner>
           </Layout.Section>
         )}
@@ -115,7 +127,7 @@ export default function BillingPage() {
               <div>
                 <p className="pp-plan-label">{hasActivePlan ? "Active plan" : "Current plan"}</p>
                 <p className="pp-plan-name">{planName}</p>
-                <p className="pp-plan-sub">{`${fmt(quota)} compression credits every month`}</p>
+                <p className="pp-plan-sub">{`Covers up to ${fmt(maxProducts)} products`}</p>
                 <div className="pp-actions">
                   <a className="pp-btn pp-btn-white" href={pricingUrl} target="_top">
                     {hasActivePlan ? "Switch plan" : "Pick a plan"}
@@ -128,9 +140,16 @@ export default function BillingPage() {
                 </div>
               </div>
               <div className="pp-plan-usage">
-                <p><strong>{fmt(used)}</strong>{` of ${fmt(quota)} used`}</p>
-                <PixelMeter pct={pct} label={`${pct}% of monthly credits used`} />
-                <p>{`${pct}% used · resets on the 1st`}</p>
+                <p><strong>{fmt(productCount)}</strong>{` of ${fmt(maxProducts)} products`}</p>
+                <PixelMeter pct={pct} label={`${pct}% of your plan's product limit`} />
+                <p>
+                  {overLimit
+                    ? "Your catalog has outgrown this plan"
+                    : `${fmt(imagesUsed)} photos compressed this month`}
+                </p>
+                {monthlyBgRemovals > 0 && (
+                  <p>{`${fmt(bgRemovals)} of ${fmt(monthlyBgRemovals)} background removals used · resets on the 1st`}</p>
+                )}
               </div>
             </div>
 
@@ -164,7 +183,7 @@ export default function BillingPage() {
                       {t.name}
                       {i === currentIdx && <span className="pp-tier-you">Current</span>}
                     </p>
-                    <p className="pp-tier-meta">{`${t.images} credits / mo · $${t.price}/mo`}</p>
+                    <p className="pp-tier-meta">{`Up to ${t.products} products · $${t.price}/mo`}</p>
                   </div>
                 </li>
               ))}

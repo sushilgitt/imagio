@@ -8,7 +8,7 @@
 //   2. send merchants to the hosted pricing page to subscribe or cancel.
 //
 // Prices and trials are set only in the Partner Dashboard. Plan NAMES there must
-// match plans.server.js (Free / Starter / Growth / Pro, plus "<name> Annual").
+// match plans.server.js (Free / Shop / Brand / Catalog, plus "<name> Annual").
 import { getPlanByName, FREE_PLAN } from "./plans.server";
 
 const INSTALLATION_QUERY = `#graphql
@@ -95,6 +95,12 @@ export async function getBillingStateCached(admin, shop) {
     }
   }
   return state;
+}
+
+// Drop a shop's cached state, e.g. right after cancelling, so features relock
+// on the next page load instead of up to BILLING_TTL_MS later.
+export function clearBillingCache(shop) {
+  billingCache.delete(shop);
 }
 
 // Builds the Shopify-hosted managed-pricing page URL where merchants can

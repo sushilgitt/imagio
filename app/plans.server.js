@@ -4,8 +4,13 @@
 // prices/trials) are created in the Partner Dashboard, and a merchant subscribes
 // to one on Shopify's hosted pricing page. The app cannot create charges; its job
 // is to read the *name* of the merchant's active subscription and map it to the
-// tier defined here — which decides the monthly image quota and which features
-// are unlocked.
+// tier defined here — which decides how large a catalog the plan covers and
+// which features are unlocked.
+//
+// Plans are priced by catalog size (`maxProducts`), not by images processed:
+// within its product limit a shop can compress, restyle and caption freely. The
+// one feature with a real per-image cost — background removal through a paid
+// API — has its own monthly allowance (`monthlyBgRemovals`).
 //
 // IMPORTANT: the plan names below (and their "<name> Annual" variants) MUST match
 // the plan names created in the Partner Dashboard exactly, because tier resolution
@@ -16,9 +21,10 @@
 // app — the billing page renders these as the plan's inclusions, so a flag for
 // an unbuilt feature would advertise something merchants can't use.
 export const FEATURES = [
-  "optimize",      // image compression / replace
-  "webp",          // WebP conversion
+  "optimize",      // WebP compression / replace
   "altText",       // AI alt text
+  "studio",        // crop, padding and background for consistent photos
+  "bgRemoval",     // AI background removal inside the studio
   "autoOptimize",  // background auto-optimize new products
 ];
 
@@ -35,40 +41,43 @@ export const PLANS = [
     name: "Free",
     price: 0,
     priceAnnual: 0,
-    monthlyImages: 100,
-    // AI alt text is intentionally NOT in Free — it's a Starter+ feature.
-    features: feat("optimize", "webp"),
+    maxProducts: 25,
+    monthlyBgRemovals: 0,
+    features: feat("optimize"),
   },
   {
-    tier: "starter",
-    name: "Starter",
-    price: 30,
-    priceAnnual: 300,
-    monthlyImages: 2000,
-    features: feat("optimize", "webp", "altText"),
+    tier: "shop",
+    name: "Shop",
+    price: 12,
+    priceAnnual: 120,
+    maxProducts: 250,
+    monthlyBgRemovals: 0,
+    features: feat("optimize", "altText", "studio"),
   },
   {
-    tier: "growth",
-    name: "Growth",
-    price: 99,
-    priceAnnual: 990,
-    monthlyImages: 15000,
-    features: feat("optimize", "webp", "altText", "autoOptimize"),
+    tier: "brand",
+    name: "Brand",
+    price: 29,
+    priceAnnual: 290,
+    maxProducts: 2000,
+    monthlyBgRemovals: 200,
+    features: feat("optimize", "altText", "studio", "bgRemoval", "autoOptimize"),
   },
   {
-    tier: "pro",
-    name: "Pro",
-    price: 350,
-    priceAnnual: 3500,
-    monthlyImages: 50000,
-    features: feat("optimize", "webp", "altText", "autoOptimize"),
+    tier: "catalog",
+    name: "Catalog",
+    price: 79,
+    priceAnnual: 790,
+    maxProducts: 20000,
+    monthlyBgRemovals: 1000,
+    features: feat("optimize", "altText", "studio", "bgRemoval", "autoOptimize"),
   },
 ];
 
 export const FREE_PLAN = PLANS[0];
 
 // Resolve a Shopify subscription name to a tier. Strips a trailing " Annual"
-// (so "Growth Annual" → "Growth") and matches case-insensitively. Falls back to
+// (so "Brand Annual" → "Brand") and matches case-insensitively. Falls back to
 // the Free tier when the name is missing or unrecognized — so an installed-but-
 // not-yet-subscribed shop still has a usable (limited) plan.
 export function getPlanByName(name) {
@@ -81,4 +90,9 @@ export function getPlanByName(name) {
 export function entitled(plan, feature) {
   const p = plan || FREE_PLAN;
   return Boolean(p.features?.[feature]);
+}
+
+// Cheapest plan that covers `productCount` products (the upgrade suggestion).
+export function planForCatalog(productCount) {
+  return PLANS.find((p) => p.maxProducts >= productCount) || PLANS[PLANS.length - 1];
 }

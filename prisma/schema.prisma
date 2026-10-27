@@ -27,20 +27,27 @@ model Session {
   refreshTokenExpires  DateTime?
 }
 
-// Per-shop, per-month image optimization counter used to enforce plan quotas.
-// `period` is "YYYY-MM"; a new row is created each month so usage resets.
+// Per-shop, per-month usage. `imagesUsed` counts compressed photos (shown as a
+// stat, not limited); `bgRemovals` counts paid background removals, which are
+// capped by the plan. `period` is "YYYY-MM"; a new row each month resets usage.
 model UsageCounter {
   id         String @id @default(cuid())
   shop       String
   period     String // "2026-06"
   imagesUsed Int    @default(0)
+  bgRemovals Int    @default(0)
 
   @@unique([shop, period])
 }
 
 // Per-shop app settings. `autoOptimize` toggles background optimization of newly
-// created products (a Growth+ feature, also gated by entitlement at runtime).
+// created products (a Brand+ feature, also gated by entitlement at runtime).
+// `studioStyle` is the last Photo Studio style applied (JSON, see
+// studio.server.js); with `autoStudio` on, Autopilot restyles new products with
+// it instead of only compressing them.
 model ShopSettings {
   shop         String  @id
   autoOptimize Boolean @default(false)
+  autoStudio   Boolean @default(false)
+  studioStyle  String?
 }

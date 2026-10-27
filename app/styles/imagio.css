@@ -682,3 +682,91 @@ body {
 @media (max-width: 600px) {
   .pp-pricing-head h1 { font-size: 32px; }
 }
+
+/* ── Photo health audit ────────────────────── */
+.pp-audit-hero {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 24px;
+  align-items: center;
+  background: var(--pp-mint-bg) var(--pp-hatch);
+  border: 1px solid var(--pp-line);
+  border-radius: var(--pp-radius);
+  padding: 24px;
+}
+.pp-audit-score {
+  width: 150px; height: 150px;
+  border-radius: 50%;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  background: #fff;
+  border: 10px solid var(--pp-mint);
+  box-shadow: var(--pp-shadow);
+}
+.pp-audit-score--warn { border-color: #F5C26B; }
+.pp-audit-score--bad { border-color: #F0A3A3; }
+.pp-audit-grade { font: 700 52px/1 var(--pp-font-display); color: var(--pp-ink); }
+.pp-audit-num { font-size: 13px; font-weight: 600; color: var(--pp-muted); margin-top: 4px; }
+.pp-audit-summary { display: grid; gap: 8px; min-width: 0; }
+.pp-audit-title { font: 700 26px/1.15 var(--pp-font-display); color: var(--pp-ink); margin: 0; }
+.pp-audit-sub, .pp-audit-foot { font-size: 13px; color: var(--pp-muted); margin: 0; }
+
+.pp-issues { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.pp-issue {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  background: #fff;
+  border: 1px solid var(--pp-line);
+  border-left: 4px solid #F5C26B;
+  border-radius: var(--pp-radius);
+  box-shadow: var(--pp-shadow);
+  padding: 18px 20px;
+}
+.pp-issue.is-clear { border-left-color: var(--pp-mint-dark); }
+.pp-issue-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pp-issue-title { font: 700 18px/1.2 var(--pp-font-display); color: var(--pp-ink); margin: 0; }
+.pp-issue-why { font-size: 13px; line-height: 1.55; color: var(--pp-muted); margin: 0; }
+.pp-issue-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.pp-issue-list { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 6px; }
+.pp-issue-list li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  font-size: 13px;
+}
+.pp-issue-list a { color: var(--pp-ink); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pp-issue-list .pp-issue-more { display: block; color: var(--pp-muted); }
+
+/* ── Photo studio ──────────────────────────── */
+.pp-studio-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.pp-studio-preview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.pp-studio-frame {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pp-muted);
+  text-align: center;
+}
+.pp-studio-frame img {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: contain;
+  background: var(--pp-hatch), #fff;
+  border: 1px solid var(--pp-line);
+  border-radius: 14px;
+}
+.pp-swatch { display: inline-flex; align-items: center; gap: 8px; }
+.pp-swatch i { width: 18px; height: 18px; border-radius: 6px; border: 1px solid var(--pp-line); display: inline-block; }
+
+@media (max-width: 900px) {
+  .pp-issues, .pp-studio-grid { grid-template-columns: minmax(0, 1fr); }
+  .pp-audit-hero { grid-template-columns: minmax(0, 1fr); justify-items: center; text-align: center; }
+}

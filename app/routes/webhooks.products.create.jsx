@@ -1,6 +1,6 @@
 // products/create webhook — background "set & forget" auto-optimization.
 //
-// When a merchant on a plan that includes autoOptimize (Growth+) has the toggle
+// When a merchant on a plan that includes autoOptimize (Brand+) has the toggle
 // enabled, every newly created product gets its images optimized automatically.
 //
 // Shopify expects a fast ACK (a slow webhook is retried / disabled), and image
@@ -14,10 +14,11 @@
 // media replacement performed during optimization can't re-trigger this webhook.
 import { authenticate, unauthenticated } from "../shopify.server";
 import db from "../db.server";
-import { getBillingState } from "../billing.server";
 import { entitled } from "../plans.server";
-import { getRemaining } from "../usage.server";
+import { getPlanStatus } from "../limits.server";
 import { optimizeBatch } from "../optimize.server";
+import { studioBatch, parseStyle, bgRemovalConfigured } from "../studio.server";
+import { getBgRemovalsLeft } from "../usage.server";
 
 // Per-shop sequential task queue. Tasks chain off the previous one so products
 // created in quick succession are processed in order rather than concurrently.
@@ -43,17 +44,30 @@ async function runAutoOptimize(shop, productGid) {
   // Offline admin client (uses the stored offline access token for the shop).
   const { admin } = await unauthenticated.admin(shop);
 
-  const { plan } = await getBillingState(admin);
-  if (!entitled(plan, "autoOptimize")) return; // plan changed since toggle was set
-  const genAlt = entitled(plan, "altText"); // Growth/Pro always include alt text
+  const status = await getPlanStatus(admin, shop);
+  if (!entitled(status.plan, "autoOptimize")) return; // plan changed since toggle was set
+  if (!status.withinLimit) return; // catalog outgrew the plan
+  const genAlt = entitled(status.plan, "altText"); // Brand/Catalog always include alt text
 
-  // Loop batches until the product is fully optimized or the monthly quota runs
-  // out. The 50-iteration ceiling is a safety backstop (250 images / batch of 6).
+  // With a saved studio style, restyle the new product (the studio output is
+  // already compressed); otherwise just compress it. The 70-iteration ceiling
+  // is a safety backstop (250 images / studio batch of 4).
+  if (settings.autoStudio && settings.studioStyle && entitled(status.plan, "studio")) {
+    const style = parseStyle(settings.studioStyle);
+    if (style.removeBg && !(entitled(status.plan, "bgRemoval") && bgRemovalConfigured())) style.removeBg = false;
+    // Decide once: switching style mid-product would restyle earlier photos again.
+    if (style.removeBg && (await getBgRemovalsLeft(shop, status.plan)) <= 0) style.removeBg = false;
+    for (let i = 0; i < 70; i++) {
+      const bgRemovalsLeft = style.removeBg ? await getBgRemovalsLeft(shop, status.plan) : 0;
+      const res = await studioBatch(admin, productGid, style, { shop, bgRemovalsLeft, genAlt });
+      if (!res.success || res.done || !res.advanced) break; // includes allowance running out
+    }
+    return;
+  }
+
   for (let i = 0; i < 50; i++) {
-    const remainingQuota = await getRemaining(shop, plan);
-    if (remainingQuota <= 0) break;
-    const res = await optimizeBatch(admin, productGid, { shop, remainingQuota, genAlt });
-    if (!res.success || res.done || res.quotaExceeded || !res.advanced) break;
+    const res = await optimizeBatch(admin, productGid, { shop, genAlt });
+    if (!res.success || res.done || !res.advanced) break;
   }
 }
 

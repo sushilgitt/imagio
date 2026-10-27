@@ -4,7 +4,8 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { useLoaderData, useFetcher, useRevalidator } from 'react-router';
 import { authenticate } from '../shopify.server';
 import { getBillingStateCached } from '../billing.server';
-import { getUsage, getRemaining } from '../usage.server';
+import { getUsage } from '../usage.server';
+import { getPlanStatus, overLimitMessage } from '../limits.server';
 import { entitled } from '../plans.server';
 import db from '../db.server';
 import { mapLimit, headSizeMB, optimizeBatch, restoreProduct, renameProductImages } from '../optimize.server';
@@ -60,12 +61,8 @@ export async function loader({ request }) {
   const filter = url.searchParams.get('filter') || 'all';
   const sortBy = url.searchParams.get('sortBy') || 'score_asc';
 
-  // Plan, usage and per-shop settings drive the quota meter + auto-optimize UI.
-  let plan = null;
-  try {
-    const state = await getBillingStateCached(admin, session.shop);
-    plan = state.plan;
-  } catch { /* fall through to Free defaults below */ }
+  // Plan coverage, usage and per-shop settings drive the sidebar + autopilot UI.
+  const status = await getPlanStatus(admin, session.shop);
   let usage = { period: '', imagesUsed: 0 };
   let autoOptimize = false;
   try {
@@ -74,10 +71,13 @@ export async function loader({ request }) {
     autoOptimize = settings?.autoOptimize ?? false;
   } catch { /* usage/settings tables not ready yet — default to zero/off */ }
   const planInfo = {
-    tier: plan?.tier || 'free',
-    name: plan?.name || 'Free',
-    monthlyImages: plan?.monthlyImages ?? 100,
-    autoOptimizeAllowed: entitled(plan, 'autoOptimize'),
+    tier: status.plan.tier,
+    name: status.plan.name,
+    maxProducts: status.maxProducts,
+    productCount: status.productCount,
+    withinLimit: status.withinLimit,
+    suggestedPlan: status.suggestedPlan,
+    autoOptimizeAllowed: entitled(status.plan, 'autoOptimize'),
   };
 
   try {
@@ -195,7 +195,7 @@ export async function action({ request }) {
       try {
         const { plan } = await getBillingStateCached(admin, session.shop);
         if (!entitled(plan, 'autoOptimize')) {
-          return { success: false, settingUpdated: true, error: 'Autopilot is included with Growth and Pro.' };
+          return { success: false, settingUpdated: true, error: 'Autopilot is included with Brand and Catalog.' };
         }
       } catch { /* if billing check fails, fall through and block enabling */
         return { success: false, settingUpdated: true, error: 'Could not verify your plan. Try again.' };
@@ -212,12 +212,13 @@ export async function action({ request }) {
   if (actionType === 'optimizeProduct') {
     const productId = formData.get('productId');
     try {
-      const { plan } = await getBillingStateCached(admin, session.shop);
-      const remainingQuota = await getRemaining(session.shop, plan);
+      const status = await getPlanStatus(admin, session.shop);
+      if (!status.withinLimit) {
+        return { success: false, productId, overLimit: true, error: overLimitMessage(status) };
+      }
       return await optimizeBatch(admin, productId, {
         shop: session.shop,
-        remainingQuota,
-        genAlt: entitled(plan, 'altText'),
+        genAlt: entitled(status.plan, 'altText'),
       });
     } catch (error) {
       const msg = error?.graphQLErrors?.[0]?.message || error?.message || 'unknown error';
@@ -226,7 +227,7 @@ export async function action({ request }) {
     }
   }
 
-  // SEO rename touches only file names — every plan, no credits.
+  // SEO rename touches only file names — every plan, even over the product limit.
   if (actionType === 'renameProduct') {
     const productId = formData.get('productId');
     try {
@@ -238,7 +239,7 @@ export async function action({ request }) {
     }
   }
 
-  // Restore is a safety net, so it's available on every plan and uses no credits.
+  // Restore is a safety net, so it's available on every plan, even over the limit.
   if (actionType === 'restoreProduct') {
     const productId = formData.get('productId');
     try {
@@ -257,7 +258,8 @@ export async function action({ request }) {
 /*  UI                                                                        */
 /* -------------------------------------------------------------------------- */
 
-// Per-product tools that run outside the compression loop (no credits used).
+// Per-product tools that run outside the compression loop (allowed even when
+// the catalog has outgrown the plan).
 const TOOLS = {
   restore: {
     actionType: 'restoreProduct',
@@ -265,8 +267,7 @@ const TOOLS = {
     busy: 'Restoring',
     title: (n) => (n > 1 ? `Restore ${n} products?` : 'Restore original photos?'),
     body: 'The original photos go back on the product in the same order, including variant images and '
-      + 'their original alt text. The compressed copies are deleted. Credits already used this month '
-      + 'are not refunded.',
+      + 'their original alt text. Imagio\'s edited copies are deleted.',
   },
   rename: {
     actionType: 'renameProduct',
@@ -275,7 +276,7 @@ const TOOLS = {
     title: (n) => (n > 1 ? `Give ${n} products SEO file names?` : 'Give this product SEO file names?'),
     body: 'Each photo is renamed from the product and its variant, e.g. linen-shirt-navy-2.jpg, so search '
       + 'engines can read what it shows. Photos stay on the product in the same order and nothing is '
-      + 're-encoded. Uses no credits. Links to the old file URL outside your product pages (for example '
+      + 're-encoded. Links to the old file URL outside your product pages (for example '
       + 'in a blog post or email) will stop working.',
   },
 };
@@ -338,26 +339,20 @@ export default function ProductOptimization() {
 
     if (data.success === false) {
       setError(data.error || 'Optimization failed');
+      // Catalog outgrew the plan — every queued product would fail the same way.
+      if (data.overLimit) queueRef.current = [];
       startNext();
       return;
     }
 
     setLiveProgress(prev => ({ ...prev, [data.productId]: data }));
 
-    // Increment the session usage meter by the newly-optimized image delta.
+    // Move the "compressed this month" stat by the newly-optimized image delta.
     const prevSeen = lastOptimizedRef.current[data.productId] || 0;
     const delta = Math.max(0, (data.optimized || 0) - prevSeen);
     if (delta > 0) {
       lastOptimizedRef.current[data.productId] = data.optimized;
       setSessionImages(s => s + delta);
-    }
-
-    // Monthly quota hit — stop the whole queue and prompt to upgrade.
-    if (data.quotaExceeded) {
-      setError('You have used this month’s compression credits. Upgrade your plan to keep going.');
-      queueRef.current = [];
-      startNext();
-      return;
     }
 
     if (data.done) {
@@ -407,12 +402,14 @@ export default function ProductOptimization() {
       setError(data.error || `${TOOLS[toolTask.kind].label} failed`);
     } else {
       if (toolTask.kind === 'restore') {
-        // Show the product as untouched straight away; the revalidate at the
-        // end of the queue brings the real numbers back from the loader.
-        setLiveProgress(prev => ({
-          ...prev,
-          [data.productId]: { score: 0, optimized: 0, sizeSavedMB: 0, compressionRate: 0 },
-        }));
+        // A full restore shows as untouched straight away. A partial one (some
+        // originals gone) drops any live override so the reloaded numbers show.
+        setLiveProgress(prev => {
+          const next = { ...prev };
+          if (data.unavailable > 0) delete next[data.productId];
+          else next[data.productId] = { score: 0, optimized: 0, sizeSavedMB: 0, compressionRate: 0 };
+          return next;
+        });
         lastOptimizedRef.current[data.productId] = 0;
       }
       setSuccessMessage(data.message);
@@ -485,11 +482,10 @@ export default function ProductOptimization() {
 
   const isBusy = activeId !== null || toolTask !== null;
 
-  // Usage meter: loader baseline + images optimized live this session.
-  const quota = plan?.monthlyImages ?? 100;
+  // Plan coverage meter (catalog size vs plan) + photos compressed this month.
   const usedImages = (usage?.imagesUsed ?? 0) + sessionImages;
-  const usagePct = quota > 0 ? Math.min(100, Math.round((usedImages / quota) * 100)) : 0;
-  const quotaReached = usedImages >= quota;
+  const coveragePct = plan.maxProducts > 0 ? Math.min(100, Math.round((plan.productCount / plan.maxProducts) * 100)) : 100;
+  const overLimit = !plan.withinLimit;
 
   const formatBytes = (mb) => {
     const v = mb || 0;
@@ -557,7 +553,7 @@ export default function ProductOptimization() {
     <Page>
       <Layout>
         <Layout.Section>
-          <PageHeader icon={ImageMagicIcon} eyebrow="Compress" title="Image compression" subtitle="Turn heavy product photos into lean WebP files, swapped in place on each product" />
+          <PageHeader icon={ImageMagicIcon} eyebrow="Compress & restore" title="Lighter photos, fully reversible" subtitle="Lean WebP files with search-friendly names — restore the originals any time" />
         </Layout.Section>
 
         {error && (
@@ -588,18 +584,20 @@ export default function ProductOptimization() {
           <div className="pp-side-card">
             <div className="pp-side-block">
               <div className="pp-side-row">
-                <span className="pp-side-title">Credits this month</span>
-                <Badge tone={plan?.tier === 'free' ? undefined : 'success'}>{`${plan?.name || 'Free'} plan`}</Badge>
+                <span className="pp-side-title">Products covered</span>
+                <Badge tone={plan.tier === 'free' ? undefined : 'success'}>{`${plan.name} plan`}</Badge>
               </div>
               <p className="pp-side-big">
-                {usedImages.toLocaleString()}
-                <span>{` / ${quota.toLocaleString()}`}</span>
+                {plan.productCount.toLocaleString()}
+                <span>{` / ${plan.maxProducts.toLocaleString()}`}</span>
               </p>
-              <PixelMeter pct={usagePct} light label={`${usagePct}% of monthly credits used`} />
-              {quotaReached && (
+              <PixelMeter pct={coveragePct} light label={`${coveragePct}% of your plan's product limit`} />
+              {overLimit ? (
                 <Text variant="bodySm" as="p" tone="critical">
-                  You have used this month's credits. Upgrade for more.
+                  {`Your catalog has outgrown ${plan.name}. Upgrade to ${plan.suggestedPlan} to keep compressing.`}
                 </Text>
+              ) : (
+                <p className="pp-side-note">{`${usedImages.toLocaleString()} photos compressed this month`}</p>
               )}
             </div>
             <div className="pp-side-block">
@@ -607,7 +605,7 @@ export default function ProductOptimization() {
                 <span className="pp-side-title">Autopilot</span>
                 {plan?.autoOptimizeAllowed
                   ? <Badge tone={autoOptimize ? 'success' : undefined}>{autoOptimize ? 'On' : 'Off'}</Badge>
-                  : <Badge tone="attention">Growth+</Badge>}
+                  : <Badge tone="attention">Brand+</Badge>}
               </div>
               <p className="pp-side-note">Compress photos on every new product automatically, in the background.</p>
               {plan?.autoOptimizeAllowed ? (
@@ -618,7 +616,7 @@ export default function ProductOptimization() {
                   disabled={settingsFetcher.state !== 'idle'}
                 />
               ) : (
-                <Text variant="bodySm" as="p" tone="subdued">Included with Growth and Pro.</Text>
+                <Text variant="bodySm" as="p" tone="subdued">Included with Brand and Catalog.</Text>
               )}
             </div>
           </div>
@@ -712,7 +710,7 @@ export default function ProductOptimization() {
                         </Button>
                       )}
                       {product.needsOptimization ? (
-                        <Button size="slim" variant="primary" onClick={() => handleOptimizeProduct(product.id)} loading={isActive} disabled={isBusy || quotaReached}>
+                        <Button size="slim" variant="primary" onClick={() => handleOptimizeProduct(product.id)} loading={isActive} disabled={isBusy || overLimit}>
                           Compress
                         </Button>
                       ) : (
@@ -740,7 +738,7 @@ export default function ProductOptimization() {
             <button type="button" className="pp-btn pp-btn-glass" onClick={() => setConfirmTool({ kind: 'rename', ids: selectedProducts })} disabled={isBusy}>
               SEO rename
             </button>
-            <button type="button" className="pp-btn pp-btn-white" onClick={handleOptimizeSelected} disabled={isBusy || quotaReached}>
+            <button type="button" className="pp-btn pp-btn-white" onClick={handleOptimizeSelected} disabled={isBusy || overLimit}>
               {activeId ? 'Compressing…' : 'Compress selected'}
             </button>
           </div>
